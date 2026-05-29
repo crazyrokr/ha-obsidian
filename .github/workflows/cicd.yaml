@@ -1,0 +1,26 @@
+---
+name: CI/CD
+
+env:
+  MONITORED_FILES: "config.json config.yaml config.yml Dockerfile rootfs"
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+      - develop
+
+permissions:
+  contents: read
+  id-token: write
+  packages: write
+
+jobs:
+  run-builder:
+    uses: crazyrokr/gha-workflows/.github/workflows/ha-addon/builder.yaml@master
+    secrets:
+      DISPATCH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
