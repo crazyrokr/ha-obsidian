@@ -1,0 +1,24 @@
+---
+name: CI/CD
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+      - develop
+
+permissions:
+  contents: read
+
+jobs:
+  run-builder:
+    uses: crazyrokr/gha-workflows/.github/workflows/ha-addon-cicd.yaml@master
+    secrets: inherit
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
