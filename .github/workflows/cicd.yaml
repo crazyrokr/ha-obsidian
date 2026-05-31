@@ -13,10 +13,12 @@ on:
 
 permissions:
   contents: read
-  id-token: write
-  packages: write
 
 jobs:
   run-builder:
     uses: crazyrokr/gha-workflows/.github/workflows/ha-addon-cicd.yaml@master
     secrets: inherit
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
