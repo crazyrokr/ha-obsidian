@@ -1,9 +1,6 @@
 ---
 name: CI/CD
 
-env:
-  MONITORED_FILES: "config.json config.yaml config.yml Dockerfile rootfs"
-
 on:
   workflow_dispatch:
   push:
