@@ -34,4 +34,3 @@ ports:
   3000/tcp: null
   3001/tcp: null
   8082/tcp: null
-image: "ghcr.io/crazyrokr/ha-obsidian"
