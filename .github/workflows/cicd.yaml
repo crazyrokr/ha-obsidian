@@ -3,6 +3,12 @@ name: CI/CD
 
 on:
   workflow_dispatch:
+    inputs:
+      branch:
+        description: "Working branch"
+        type: string
+        required: false
+        default: ""
   push:
     branches:
       - master
@@ -15,7 +21,18 @@ permissions:
   contents: read
 
 jobs:
+  auto-lock:
+    runs-on: ubuntu-latest
+    name: Pin Docker Images
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: crazyrokr/gha-workflows/ha-addon-auto-locker@master
+        with:
+          branch: ${{ github.event.inputs.branch }}
   run-builder:
+    needs: auto-lock
     uses: crazyrokr/gha-workflows/.github/workflows/ha-addon-cicd.yaml@master
     secrets: inherit
     permissions:
