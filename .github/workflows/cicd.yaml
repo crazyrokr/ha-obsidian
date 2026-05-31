@@ -19,5 +19,4 @@ permissions:
 jobs:
   run-builder:
     uses: crazyrokr/gha-workflows/.github/workflows/ha-addon-cicd.yaml@master
-    secrets:
-      DISPATCH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+    secrets: inherit
