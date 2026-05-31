@@ -1,6 +1,6 @@
 build_from:
-  amd64: "lscr.io/linuxserver/obsidian:amd64-v1.9.14-ls94@sha256:8dbb883573ac2f569e05c39c104c21dec764e06b4e2af49eb1df310d0c0e7555"
-  aarch64: "lscr.io/linuxserver/obsidian:arm64v8-v1.9.14-ls94@sha256:03b36a99986072015f85c710771fe8e7a0d2d846faca7e4bbed0da94c2b96578"
+  amd64: "lscr.io/linuxserver/obsidian:amd64-v1.9.14-ls94@sha256:39c4e7f21dc4c3cb3c47b0dde547ee7a7b1909cee236fb31655d7ff01e9c4cc2"
+  aarch64: "lscr.io/linuxserver/obsidian:arm64v8-v1.9.14-ls94@sha256:3e43e5f2d6552ed856695c555991a58ac490fbe53146a787ca1f615caab5ad3d"
 labels:
   org.opencontainers.image.title: "Home Assistant Obsidian"
   org.opencontainers.image.description: "Runs Obsidian within your Home Assistant setup providing integration of live-features"
