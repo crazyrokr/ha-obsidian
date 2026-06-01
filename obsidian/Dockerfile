@@ -1,4 +1,4 @@
-FROM lscr.io/linuxserver/obsidian:v1.12.7-ls132
+FROM lscr.io/linuxserver/obsidian:v1.12.7-ls132@sha256:df974792e7b1d9dcab27da9960296897bc5a4c6dcad31da42842104c4e91966e
 
 RUN mkdir /share
 RUN echo "[ -f /config/.config/obsidian/obsidian.json ] || \
