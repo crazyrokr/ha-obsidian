@@ -33,7 +33,7 @@ jobs:
           branch: ${{ github.event.inputs.branch }}
   run-builder:
     needs: auto-lock
-    uses: crazyrokr/gha-workflows/.github/workflows/ha-addon-cicd.yaml@feature/remove-custom-matrix
+    uses: crazyrokr/gha-workflows/.github/workflows/ha-addon-cicd.yaml@fix-caching-error
     secrets: inherit
     permissions:
       contents: read
