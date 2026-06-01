@@ -16,7 +16,14 @@
     {
       "fileMatch": ["(^|/)build\\.yaml$"],
       "matchStrings": [
-        "\\s+(?<arch>aarch64|amd64|armhf|armv7|i386):\\s+\"(?<depName>[^\"]+):(?<currentValue>[^\"]+)\""
+        "\\s+(?<arch>aarch64|amd64|armhf|armv7|i386):\\s+\"(?<depName>[^\"]+):(?<currentValue>[^\"@]+)(?:@.+)?\""
+      ],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "fileMatch": ["(^|/)Dockerfile$"],
+      "matchStrings": [
+        "\\s+FROM\\s+(?<depName>[^\"]+):(?<currentValue>[^\"@]+)(?:@.+)?"
       ],
       "datasourceTemplate": "docker"
     }
