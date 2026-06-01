@@ -28,9 +28,10 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v6
-      - uses: crazyrokr/gha-workflows/ha-addon-auto-locker@master
+      - uses: crazyrokr/gha-workflows/ha-addon-auto-locker@feature/auto-lock-config
         with:
           branch: ${{ github.event.inputs.branch }}
+          lookup_sources: Dockerfile
   run-builder:
     needs: auto-lock
     uses: crazyrokr/gha-workflows/.github/workflows/ha-addon-cicd.yaml@master
