@@ -17,6 +17,11 @@ on:
       - master
       - develop
 
+# Cancel superseded runs on the same ref to avoid wasted builds.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -26,12 +31,18 @@ jobs:
     name: Pin Docker Images
     permissions:
       contents: write
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
-      - uses: crazyrokr/gha-workflows/ha-addon-auto-locker@master
+      # Only run the pin job on pushes (it writes back commits); PRs/fork checks
+      # stay read-only and skip the auto-commit step.
+      - if: github.event_name == 'push'
+        uses: actions/checkout@v6
+      - if: github.event_name == 'push'
+        uses: crazyrokr/gha-workflows/ha-addon-auto-locker@master
         with:
           branch: ${{ github.event.inputs.branch }}
           lookup_sources: Dockerfile
+
   run-builder:
     needs: auto-lock
     uses: crazyrokr/gha-workflows/.github/workflows/ha-addon-cicd.yaml@master

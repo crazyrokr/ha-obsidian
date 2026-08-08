@@ -1,0 +1,25 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+
+# permissions
+lsiown -R abc:abc \
+    /config
+lsiown -R abc:abc \
+    /opt/obsidian
+
+# ensure mandatory mount points that Home Assistant provides at runtime
+mkdir -p /config /share
+lsiown -R abc:abc \
+    /config \
+    /share
+
+# bootstrap an Obsidian default config so the UI never blocks on the
+# "welcome" wizard or auto-update prompts on a fresh install
+obsidian_config="/config/.config/obsidian/obsidian.json"
+if [ ! -f "${obsidian_config}" ]; then
+    mkdir -p "$(dirname "${obsidian_config}")"
+    cat > "${obsidian_config}" <<-EOF
+{"frame":"native","updateDisabled":true}
+	EOF
+    chown -R abc:abc "$(dirname "${obsidian_config}")"
+fi
