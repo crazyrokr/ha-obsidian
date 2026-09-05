@@ -13,7 +13,8 @@
     },
     {
       "matchPackageNames": ["lscr.io/linuxserver/**"],
-      "versioning": "loose"
+      "versioning": "regex:^v?(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-ls(?<build>\\d+)$",
+      "extractVersion": "^(?<version>v\\d+\\.\\d+\\.\\d+-ls\\d+)$"
     }
   ],
   "customManagers": [
