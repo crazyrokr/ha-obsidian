@@ -2,7 +2,7 @@
 
 # Base is a multi-arch (aarch64/amd64) linuxserver/obsidian image, pinned to a
 # digest so CI builds each architecture from a reproducible, immutable base.
-FROM lscr.io/linuxserver/obsidian:v1.13.4-ls142@sha256:90fd8a7b03ec5cafb53e596296bbbe99f2dca2ef553bbd3d40d295ef90419921
+FROM lscr.io/linuxserver/obsidian:v1.13.7-ls144@sha256:c6c86336a2cf57506b0db2beb09ef4a50170808820a59c20063e669d12122dd4
 
 # Overlay the add-on's s6 init service (bootstrap config + permissions).
 # The base image already ships its own init-obsidian-config service; our run
