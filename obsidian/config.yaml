@@ -1,5 +1,5 @@
 name: Obsidian
-version: "0.7.0"
+version: "0.8.0"
 slug: obsidian
 description: Runs Obsidian within your Home Assistant setup providing integration of live-features
 url: https://github.com/crazyrokr/ha-obsidian/tree/main/obsidian
@@ -8,8 +8,28 @@ panel_icon: "mdi:note-edit"
 arch:
   - aarch64
   - amd64
+
+# Prefer ingress for external access via the supervisor.
+ingress: true
+ingress_port: 3000
+
+# Expose the web/VNC ports as optional host binds; null = not published.
+ports:
+  3000/tcp: null
+  3001/tcp: null
+  8082/tcp: null
+ports_description:
+  3000/tcp: "Obsidian web interface"
+  3001/tcp: "Desktop / noVNC port"
+  8082/tcp: "Alternative VNC port"
+
+# Supervisor does not run on our behalf; base image runs its own s6-overlay init.
 init: false
+
+# Container-scoped tmpfs for volatile runtime files.
 tmpfs: true
+
+# Persist config across restarts.
 map:
   - type: addon_config
     read_only: False
@@ -17,6 +37,7 @@ map:
   - type: share
     read_only: False
     path: /share
+
 environment:
   PUID: "1000"
   PGID: "1000"
@@ -27,10 +48,5 @@ environment:
   PIXELFLUX_WAYLAND: "false"
   SELKIES_UI_SHOW_SIDEBAR: "false"
   NO_DECOR: "true"
-ingress: true
-ingress_port: 3000
-ports:
-  3000/tcp: null
-  3001/tcp: null
-  8082/tcp: null
+
 image: "ghcr.io/crazyrokr/ha-obsidian"
