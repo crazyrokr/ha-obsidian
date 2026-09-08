@@ -1,0 +1,262 @@
+# Obsidian Add-on Theme Synchronization with Home Assistant
+
+This guide describes how the add-on automatically matches the Obsidian theme
+(`obsidian` for dark, `moonstone` for light) to the active Home Assistant
+theme whenever the web UI is opened via **Open Web UI** or the side panel.
+
+This document supersedes the first draft of the plan. Section 2 records the
+defects found in that draft; the rest is the corrected, implemented design.
+
+---
+
+## 1. Architecture
+
+```text
+Browser (Selkies dashboard page)
+  │  theme-sync.js (injected into the dashboard source HTML)
+  │  1. reads HA theme vars from window.parent (same-origin via ingress)
+  │  2. falls back to prefers-color-scheme (standalone tab)
+  │  3. classifies by WCAG relative luminance (any HA theme, not just stock)
+  ▼
+POST <page-origin><page-path>/api/set-theme?theme=obsidian|moonstone
+  ▼
+nginx (port 3000/3001, location /api/set-theme)
+  ▼
+theme_server.py  (s6 service, loopback 127.0.0.1:8090, runs as abc)
+  ▼
+<vault>/.obsidian/appearance.json   (atomic write, keys preserved, abc-owned)
+  ▼
+obsidian reload  (system CLI, best-effort, only when the value changed)
+  ▼
+Obsidian applies the theme live, without restarting the add-on
+```
+
+Key properties:
+
+- **Detection is luminance-based.** The client parses the resolved value of
+  `--clear-background-color` (fallback `--primary-background-color`) and
+  compares WCAG relative luminance against 0.5. This works for the stock HA
+  themes *and* custom community themes, where string-matching colors fails.
+- **The endpoint is derived from the page location.** Under HA ingress the
+  page lives at `https://<ha>/api/ingress/<token>`, so a hardcoded absolute
+  path would hit HA core, not the add-on. Deriving the endpoint from
+  `window.location` is correct for both ingress and standalone access.
+- **All base-image edits are made at build time against the regeneration
+  sources** (see Section 2.3), so they survive the boot-time regeneration.
+- **The vault is resolved per request**: `THEME_SYNC_VAULT` override → most
+  recent vault in Obsidian's global config → `/config`.
+- **The running app is reloaded through the Obsidian CLI.** At boot,
+  `enable_cli.py` merges `"cli": true` into the global config (the key the
+  app gates every CLI command on). After an actual theme change the daemon
+  runs `obsidian reload` best-effort; a failed reload never fails the API —
+  the file is correct and the theme applies on the next app start.
+
+---
+
+## 2. Defects found in the first draft
+
+Verified against the actual base image
+(`lscr.io/linuxserver/obsidian:v1.12.7-ls132`):
+
+1. **`apk add python3` — wrong and unnecessary.** The image is Debian 13
+   (trixie), not Alpine; `apk` does not exist, so the build fails. Python
+   3.13 is already installed at `/usr/bin/python3`.
+2. **Wrong web stack.** The draft targeted `/usr/share/kasmvnc/www/index.html`;
+   that path does not exist. The UI is **Selkies**, served by nginx from
+   `/usr/share/selkies/web/`.
+3. **Transient nginx edits.** `init-nginx` re-copies the template
+   `/defaults/default.conf` over the live config and re-copies the dashboard
+   source at *every boot*. The draft's runtime `sed` of
+   `/etc/nginx/sites-enabled/default` therefore only survives until the next
+   restart. The durable targets are the template and the dashboard *source*.
+4. **Broken theme detection.** `clearBg === "#111"` never matches HA's
+   `#111111`; `rgb(17, 17, 17)` is not the form `getComputedStyle` returns
+   for a custom property; `primaryBg.includes("surface-container")` is dead
+   code — a color value never contains a token name. Detection failed even
+   for the default theme and for every custom theme.
+5. **Absolute fetch path breaks the ingress case** (see Section 1).
+6. **"Applies without restart" was assumed, not verified.** The daemon now
+   makes the write robust (atomic + owned); live application is an explicit
+   verification step with a documented fallback.
+7. **Ownership/atomicity gaps.** A root-owned, in-place-rewritten
+   `appearance.json` risks both permission errors for the `abc` user and a
+   torn read by Obsidian. Fixed by running as `abc`, atomic `os.replace`,
+   and best-effort `PUID`/`PGID` chown.
+8. **Always-200 API.** Invalid themes now return 400; unknown paths 404.
+9. **No tests, no ADR** (required by project policy). Both added:
+   `ha-theme-sync/test_theme_server.py` and
+   `obsidian/adr/0001-obsidian-ha-theme-sync.md`.
+10. **`FROM ...:latest`** would break the repo's digest pinning, Renovate and
+    the auto-locker CI. The existing pinned base is kept and extended.
+
+---
+
+## 3. Verified facts about the base image
+
+| Fact | Evidence |
+|---|---|
+| Debian 13 (trixie), not Alpine | `/etc/os-release` in the image |
+| Python 3.13.5 at `/usr/bin/python3` | `command -v python3` in the image |
+| Web UI is Selkies, served by nginx on 3000 (HTTP) / 3001 (HTTPS) | `/defaults/default.conf`, `svc-selkies/run` |
+| Runtime web dir `/usr/share/selkies/web/` is re-copied from `/usr/share/selkies/selkies-dashboard/` every boot | `init-nginx/run` |
+| Runtime nginx config is re-copied from `/defaults/default.conf` every boot | `init-nginx/run` |
+| s6-overlay entrypoint (`/init`); `/etc/services.d` is the standard services layer; LSIO services use `s6-setuidgid abc` | image entrypoint, `svc-selkies/run` |
+| Obsidian autostarted bare (`obsidian`); vault is user-provided; global config at `/config/.config/obsidian/obsidian.json` (HOME=/config) | `/defaults/autostart`, `id abc` |
+| HA ingress strips `/api/ingress/<token>` and forwards the rest unchanged (no `/api` re-added) | Supervisor `api/ingress.py` |
+
+---
+
+## 4. File layout
+
+```text
+obsidian/
+├── Dockerfile                              # merged: pinned base + theme-sync layer
+├── config.yaml                             # unchanged (ingress, ports, maps)
+├── adr/
+│   └── 0001-obsidian-ha-theme-sync.md      # architecture decision record
+├── ha-theme-sync/
+│   ├── theme_server.py                     # daemon (stdlib only)
+│   ├── theme-sync.js                       # client detection
+│   ├── enable_cli.py                       # boot-time CLI enablement
+│   └── test_theme_server.py                # pytest suite (Given-When-Then)
+└── root/etc/services.d/theme-api/run       # s6 longrun service
+```
+
+---
+
+## 5. Step-by-step breakdown
+
+### Step 1 — Theme daemon (`ha-theme-sync/theme_server.py`)
+
+**Goal.** A loopback HTTP service that writes the requested theme into the
+active vault, safely.
+
+- `POST /api/set-theme?theme=obsidian|moonstone` → 200
+  `{"status":"ok","changed":bool,"reloaded":bool}`; 400 for missing/unknown
+  theme; 404 for other paths.
+- Pure, unit-testable functions:
+  - `parse_color()` — `#rgb`, `#rrggbb`, `#rrggbbaa`, `rgb()`, `rgba()`;
+    rejects out-of-range and malformed values (false-positive guard).
+  - `relative_luminance()` / `is_dark_color()` — WCAG luminance, threshold
+    0.5 (boundary behavior tested at the 0.5 luminance edge).
+  - `resolve_vault()` — `THEME_SYNC_VAULT` → newest `ts` in
+    `<home>/.config/obsidian/obsidian.json` → `/config`; corrupt, missing or
+    malformed configs all fall through to the default.
+  - `resolve_owner()` — `PUID`/`PGID`, then the `abc` account.
+  - `apply_theme()` — validates against the allowlist, preserves unrelated
+    keys, writes via temp file + `os.replace` (atomic), chowns best-effort,
+    no temp files left behind, corrupt/foreign existing files are replaced.
+  - `reload_obsidian()` — runs `obsidian reload` via
+    `subprocess.run(check=True, timeout=15)` with explicit
+    `HOME`/`XDG_RUNTIME_DIR`; never raises, returns `False` when the CLI or
+    the app is unavailable.
+  - `handle_set_theme()` — orchestrates vault/owner resolution,
+    `apply_theme`, then `reload_obsidian` only when the value actually
+    changed; returns `{"changed": bool, "reloaded": bool}`.
+- Runs as a stdlib-only script (`http.server.ThreadingHTTPServer`).
+
+**Verify.** `python3 -m pytest ha-theme-sync/ -v` — all green.
+
+### Step 2 — Client detection (`ha-theme-sync/theme-sync.js`)
+
+**Goal.** Determine the HA theme in the browser and request it.
+
+- Same luminance logic as the daemon (mirrored in JS), reading
+  `--clear-background-color` / `--primary-background-color` from
+  `window.parent`; cross-origin failures degrade to `prefers-color-scheme`.
+- Endpoint built from `window.location` (ingress-safe, see Section 1).
+- Runs on load and re-checks every 15 s, so runtime HA theme switches are
+  picked up; repeats a failed send on the next tick.
+
+**Verify.** Served file check (Step 5) + end-to-end smoke test (Section 6).
+
+### Step 3 — s6 service (`root/etc/services.d/theme-api/run`)
+
+**Goal.** Run the daemon for the container lifetime.
+
+```sh
+#!/usr/bin/with-contenv bash
+exec s6-setuidgid abc python3 /opt/ha-theme-sync/theme_server.py
+```
+
+Running as `abc` means the files the daemon creates are owned by the add-on
+user from the start (matching LSIO's own service pattern).
+
+**Verify.** After boot, the process is visible in the s6 service list and
+`ss -ltn` shows `127.0.0.1:8090`.
+
+### Step 4 — Build-time web hooks (Dockerfile)
+
+**Goal.** Make the web UI reach the daemon, durably.
+
+- Copy `theme_server.py` + `theme-sync.js` + `enable_cli.py` to
+  `/opt/ha-theme-sync/`, the s6 service to `/etc/services.d/theme-api/`,
+  and `chmod +x` the run script.
+- Hook `enable_cli.py` into the boot-time `init-obsidian-config` service so
+  `"cli": true` is merged into the global config before the app first reads
+  it (idempotent: preserves user keys, respects an explicit
+  `"cli": false`).
+- Insert into the nginx **template** `/defaults/default.conf` (both server
+  blocks, anchored on `location SUBFOLDER {`):
+  ```nginx
+  location /api/set-theme { proxy_pass http://127.0.0.1:8090; }
+  location /theme-sync.js { alias /opt/ha-theme-sync/theme-sync.js; }
+  ```
+- Insert `<script src="/theme-sync.js"></script>` before `</head>` in the
+  dashboard **source** `/usr/share/selkies/selkies-dashboard/index.html`
+  (idempotency-guarded).
+- Grep assertions fail the build if the expected anchors are missing, so a
+  future base-image bump cannot silently drop the feature.
+- The existing pinned base and `mkdir /share` steps are kept untouched; the
+  `init-obsidian-config` boot script is only extended with the CLI
+  enablement line.
+
+**Verify.** `docker build` succeeds; after boot, the live config contains
+both locations (Section 6).
+
+### Step 5 — ADR + tests
+
+- `obsidian/adr/0001-obsidian-ha-theme-sync.md` records the decision, the
+  rejected alternatives (runtime sed, `apk`, KasmVNC injection, string-based
+  detection) and the consequences.
+- `ha-theme-sync/test_theme_server.py` — 70+ Given-When-Then tests covering
+  parsing edge cases, threshold boundaries, vault resolution fall-throughs,
+  atomicity, ownership, CLI reload success/failure paths, CLI enablement
+  merges, API status codes and idempotency.
+
+**Verify.** `python3 -m pytest ha-theme-sync/ -v` all green; `shellcheck`
+on the run script.
+
+---
+
+## 6. Verification & troubleshooting (end-to-end)
+
+1. **Build** the image (CI or `docker build -f obsidian/Dockerfile obsidian`).
+2. **Boot** the container with a `/config` volume; confirm:
+   - s6 shows `theme-api` up; daemon log line
+     `[ha-theme-sync] listening on 127.0.0.1:8090`;
+   - `nginx -t` passes at runtime (certs exist by then);
+   - `GET /theme-sync.js` → 200, JS body;
+   - dashboard `GET /` HTML contains `<script src="/theme-sync.js">`.
+3. **API:**
+   - `POST /api/set-theme?theme=moonstone` → 200, `changed:true`;
+   - again → 200, `changed:false`;
+   - `?theme=purple` → 400; no theme → 400; other path → 404.
+4. **Vault file:** `cat <vault>/.obsidian/appearance.json` shows
+   `"theme": "moonstone"`, owned by the add-on user, other keys intact.
+5. **Live apply:** switch the HA theme and confirm the running Obsidian
+   follows within ~15 s *without* restarting the add-on — the API response
+   shows `"reloaded": true` when `obsidian reload` succeeded. If
+   `"reloaded"` is `false` (CLI unavailable), restart the app once — the
+   file is already correct, so the theme applies on next start.
+6. **Failure modes:**
+   - *404 from HA core on the POST* → the page is not under ingress and the
+     endpoint derivation regressed; check `theme-sync.js` endpoint logic.
+   - *Permission errors on appearance.json* → the daemon is not running as
+     `abc`; check the s6 run script.
+   - *Feature disappears after a base-image bump* → the build-time grep
+     assertions should have failed the build; inspect the Dockerfile layer.
+   - *`"reloaded": false` in the API response* → the CLI gate is closed or
+     the app is not running: check `"cli": true` in
+     `/config/.config/obsidian/obsidian.json` and run
+     `s6-setuidgid abc obsidian help` to see the CLI error text.

@@ -1,0 +1,100 @@
+# ADR 0001: Obsidian theme synchronization with Home Assistant
+
+- Status: accepted
+- Date: 2026-09-06
+- Deciders: maintainers
+
+## Context
+
+Users expect the Obsidian add-on to follow the Home Assistant theme: dark HA
+theme means the Obsidian `obsidian` (dark) theme, light means `moonstone`.
+The HA theme is a purely client-side concern (CSS variables in the HA
+frontend); the HA backend has no API for it, so the container cannot discover
+it server-side. The add-on is served to HA through ingress
+(`config.yaml: ingress: true`), which means the add-on web UI loads in a
+same-origin iframe of the HA window, making the HA CSS variables readable.
+
+The base image (`lscr.io/linuxserver/obsidian`, verified at
+`v1.12.7-ls132`) is Debian trixie, runs s6-overlay (`/init`), serves its
+Selkies web UI from nginx on ports 3000/3001, and regenerates its web stack
+at every boot:
+
+- `init-nginx` copies `/defaults/default.conf` over
+  `/etc/nginx/sites-available/default` and re-copies
+  `/usr/share/selkies/selkies-dashboard/` to `/usr/share/selkies/web/`.
+- Services in `/etc/services.d` are started by s6-overlay as longrun
+  services; LSIO's own services live in `/etc/s6-overlay/s6-rc.d/`.
+- Python 3.13 is already present at `/usr/bin/python3`; the web client is
+  Selkies, not KasmVNC.
+
+## Decision
+
+A small loopback HTTP daemon writes the theme into the active vault's
+`.obsidian/appearance.json`; a client script injected into the web UI
+detects the HA theme and posts it to the daemon through nginx.
+
+1. **Detection is luminance-based, never string-matching.** The client reads
+   `--clear-background-color` (fallback `--primary-background-color`) from
+   the parent window, parses the color, and compares WCAG relative
+   luminance against 0.5. This works for the stock HA themes and any custom
+   theme. When the parent window is not accessible (standalone tab), the
+   browser `prefers-color-scheme` is used. Detection runs on load and
+   re-checks every 15 s so runtime theme switches are picked up.
+2. **The endpoint is derived from the page location, not hardcoded.**
+   Under ingress the page URL is `https://<ha>/api/ingress/<token>...`, so a
+   hardcoded `/api/set-theme` would hit HA core instead of the add-on. The
+   client posts to `<origin><pathname>/api/set-theme`, which is correct for
+   both ingress and standalone access. Same-origin in both cases, so no CORS
+   is needed.
+3. **All base-image edits happen at build time, against the regeneration
+   sources.** The nginx `location` blocks are inserted into the template
+   `/defaults/default.conf` and the `<script>` tag into the *source*
+   dashboard `/usr/share/selkies/selkies-dashboard/index.html`, so both
+   survive the boot-time regeneration. No runtime `sed` of regenerated files,
+   no `/custom-cont-init.d` ordering dependency.
+4. **The daemon resolves the vault per request.** Priority: `THEME_SYNC_VAULT`
+   environment override, then the most recent vault recorded in Obsidian's
+   global config (`<home>/.config/obsidian/obsidian.json`), then `/config`.
+   The theme file is per-vault (`<vault>/.obsidian/appearance.json`) and the
+   vault is user-provided at runtime, so it must not be assumed.
+5. **Writes are atomic and ownership-safe.** The new value is written to a
+   temp file in the same directory and renamed over
+   `appearance.json` (`os.replace`), preserving unrelated keys. The daemon
+   runs as `abc` (s6 `s6-setuidgid`) and additionally chowns best-effort to
+   `PUID`/`PGID`, so the app user always owns the file.
+6. **Strict API semantics.** `POST /api/set-theme?theme=obsidian|moonstone`
+   returns 200 with `{"status":"ok","changed":bool,"reloaded":bool}`, 400
+   for a missing or unknown theme, 404 for other paths.
+7. **Live application uses the Obsidian system CLI, not a restart.** A
+   boot-time script (`enable_cli.py`, hooked into the base image's
+   `init-obsidian-config` service) idempotently merges `"cli": true` into
+   the global config `<home>/.config/obsidian/obsidian.json` — the key the
+   app gates every CLI command on — preserving user keys and an explicit
+   `false`. After a successful theme *change* (not a no-op), the daemon
+   invokes `obsidian reload` best-effort (15 s timeout) with
+   `HOME=/config` and `XDG_RUNTIME_DIR=/config/.XDG` so the CLI client
+   finds the app socket. A failed reload is reported as
+   `reloaded: false` but never fails the request: the file is already
+   correct and the theme applies on the next app start.
+
+## Consequences
+
+- The feature depends on the Selkies dashboard source and the nginx template
+  of the pinned base image; the build fails loudly if their expected anchors
+  disappear (grep assertions in the Dockerfile), so base-image bumps are
+  validated in CI before release.
+- A theme change is applied to a running app through `obsidian reload`. If
+  the CLI is unavailable (app not started yet, or a base image whose binary
+  does not accept the command), the daemon degrades to write-only and the
+  theme applies on the next app start; the API reports which path was taken
+  via `reloaded`.
+- Enabling the CLI requires the app to read `"cli": true` from its global
+  config *before* it starts, so the merge runs in the boot-time
+  `init-obsidian-config` service, not at first request.
+- The daemon spawns one short-lived subprocess (`obsidian reload`) per
+  actual theme change — never per request with an unchanged value.
+- `/api/set-theme` is reachable by anyone who can open the add-on web UI.
+  It only accepts two whitelisted values and writes one key to the vault
+  config, so the impact surface is negligible.
+- The `selkies-dashboard-wish` dashboard variant is not instrumented; the
+  add-on uses the default `selkies-dashboard`.
