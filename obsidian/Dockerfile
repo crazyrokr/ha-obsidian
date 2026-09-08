@@ -15,8 +15,7 @@ COPY root/etc/s6-overlay/s6-rc.d/user/contents.d/init-obsidian-cli \
 # keys, which the daemon needs to run `obsidian reload` after a theme change.
 # It depends on the base image's init-obsidian-config so it runs after
 # /config is chowned.
-RUN chmod +x /etc/s6-overlay/s6-rc.d/init-obsidian-cli/run \
- && bash -n /etc/s6-overlay/s6-rc.d/init-obsidian-cli/run \
+RUN bash -n /etc/s6-overlay/s6-rc.d/init-obsidian-cli/run \
  && grep -qx oneshot /etc/s6-overlay/s6-rc.d/init-obsidian-cli/type \
  && test -f /etc/s6-overlay/s6-rc.d/init-obsidian-cli/dependencies.d/init-obsidian-config \
  && test -f /etc/s6-overlay/s6-rc.d/user/contents.d/init-obsidian-cli
@@ -24,8 +23,7 @@ RUN chmod +x /etc/s6-overlay/s6-rc.d/init-obsidian-cli/run \
 # Durable web hooks: the nginx config and the dashboard are regenerated from
 # /defaults/default.conf and /usr/share/selkies/selkies-dashboard at every
 # boot, so the edits go into those sources at build time.
-RUN chmod +x /etc/services.d/theme-api/run \
- && sed -i 's|location SUBFOLDER {|location /api/set-theme {\n  proxy_pass http://127.0.0.1:8090;\n}\nlocation /theme-sync.js {\n  alias /opt/ha-theme-sync/theme-sync.js;\n}\nlocation SUBFOLDER {|g' /defaults/default.conf \
+RUN sed -i 's|location SUBFOLDER {|location /api/set-theme {\n  proxy_pass http://127.0.0.1:8090;\n}\nlocation /theme-sync.js {\n  alias /opt/ha-theme-sync/theme-sync.js;\n}\nlocation SUBFOLDER {|g' /defaults/default.conf \
  && ( grep -q theme-sync.js /usr/share/selkies/selkies-dashboard/index.html \
       || sed -i 's|</head>|<script src="./theme-sync.js"></script></head>|' /usr/share/selkies/selkies-dashboard/index.html ) \
  && grep -q api/set-theme /defaults/default.conf \
