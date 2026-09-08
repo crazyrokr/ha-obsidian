@@ -1,0 +1,24 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+# Boot-time oneshot: merge the CLI defaults into the Obsidian global config
+# so a running app accepts `obsidian reload` (user keys win, corrupt or
+# non-object config files are replaced).
+set -euo pipefail
+
+home="${OBSIDIAN_HOME:-/config}"
+dir="$home/.config/obsidian"
+file="$dir/obsidian.json"
+mkdir -p -m 755 "$dir"
+
+tmp="$(mktemp "$dir/.obsidian-XXXXXX")"
+if [[ -f "$file" ]] && jq -e 'type == "object"' "$file" >/dev/null 2>&1; then
+  jq -c '({"frame": "native", "updateDisabled": true, "cli": true}) + .' "$file" >"$tmp"
+else
+  printf '{"frame":"native","updateDisabled":true,"cli":true}\n' >"$tmp"
+fi
+chmod 0644 "$tmp"
+mv -f "$tmp" "$file"
+
+# Runs as root, after the base image chowned /config; re-own what we created.
+# Best-effort so the script also runs in non-root test environments.
+chown abc:abc "$dir" "$file" 2>/dev/null || :

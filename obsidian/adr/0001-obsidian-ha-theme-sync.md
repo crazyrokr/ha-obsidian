@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-09-06
+- Last updated: 2026-09-08
 - Deciders: maintainers
 
 ## Context
@@ -66,16 +67,22 @@ detects the HA theme and posts it to the daemon through nginx.
    returns 200 with `{"status":"ok","changed":bool,"reloaded":bool}`, 400
    for a missing or unknown theme, 404 for other paths.
 7. **Live application uses the Obsidian system CLI, not a restart.** A
-   boot-time script (`enable_cli.py`, hooked into the base image's
-   `init-obsidian-config` service) idempotently merges `"cli": true` into
-   the global config `<home>/.config/obsidian/obsidian.json` — the key the
-   app gates every CLI command on — preserving user keys and an explicit
-   `false`. After a successful theme *change* (not a no-op), the daemon
-   invokes `obsidian reload` best-effort (15 s timeout) with
-   `HOME=/config` and `XDG_RUNTIME_DIR=/config/.XDG` so the CLI client
-   finds the app socket. A failed reload is reported as
-   `reloaded: false` but never fails the request: the file is already
-   correct and the theme applies on the next app start.
+   dedicated s6-rc oneshot service (`init-obsidian-cli`, declared under
+   `/etc/s6-overlay/s6-rc.d/` and activated by the `user` bundle)
+   idempotently merges `"cli": true` into the global config
+   `<home>/.config/obsidian/obsidian.json` — the key the app gates every
+   CLI command on — preserving user keys and an explicit `false`, and
+   replacing corrupt or non-object files with the defaults (atomic
+   replace, re-owned for the `abc` user). It depends on the base image's
+   `init-obsidian-config`, so it runs after `/config` is chowned. After a
+   successful theme *change* (not a no-op), the daemon invokes the CLI
+   client binary `/opt/obsidian/obsidian-cli reload` best-effort (15 s
+   timeout) with `HOME=/config` and `XDG_RUNTIME_DIR=/config/.XDG` so the
+   client finds the app socket — never the `obsidian` on PATH, which in
+   this image is the app launcher and would start a second instance.
+   A failed reload is reported as `reloaded: false` but never fails the
+   request: the file is already correct and the theme applies on the next
+   app start.
 
 ## Consequences
 
@@ -83,15 +90,18 @@ detects the HA theme and posts it to the daemon through nginx.
   of the pinned base image; the build fails loudly if their expected anchors
   disappear (grep assertions in the Dockerfile), so base-image bumps are
   validated in CI before release.
-- A theme change is applied to a running app through `obsidian reload`. If
-  the CLI is unavailable (app not started yet, or a base image whose binary
-  does not accept the command), the daemon degrades to write-only and the
+- A theme change is applied to a running app through `obsidian-cli reload`.
+  If the CLI is unavailable (app not started yet, or a base image whose
+  client does not accept the command), the daemon degrades to write-only and the
   theme applies on the next app start; the API reports which path was taken
   via `reloaded`.
 - Enabling the CLI requires the app to read `"cli": true` from its global
-  config *before* it starts, so the merge runs in the boot-time
-  `init-obsidian-config` service, not at first request.
-- The daemon spawns one short-lived subprocess (`obsidian reload`) per
+  config *before* it starts, so the merge runs as a boot-time s6-rc oneshot
+  in the `user` bundle, not at first request. The oneshot is a separate
+  service, so a failure there cannot mark the base image's
+  `init-obsidian-config` service as failed, and boot continues regardless
+  (the previous config stays intact thanks to the atomic replace).
+- The daemon spawns one short-lived subprocess (`obsidian-cli reload`) per
   actual theme change — never per request with an unchanged value.
 - `/api/set-theme` is reachable by anyone who can open the add-on web UI.
   It only accepts two whitelisted values and writes one key to the vault

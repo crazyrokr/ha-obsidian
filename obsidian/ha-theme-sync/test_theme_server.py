@@ -8,6 +8,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import subprocess
 import sys
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -16,7 +17,6 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import enable_cli as ec  # noqa: E402
 import theme_server as ts  # noqa: E402
 
 
@@ -564,7 +564,7 @@ class TestReloadObsidian:
         # When the app is asked to reload
         ts.reload_obsidian(env={})
         # Then the default command is run with check enabled and a timeout
-        assert calls[0]["argv"] == ["obsidian", "reload"]
+        assert calls[0]["argv"] == ["/opt/obsidian/obsidian-cli", "reload"]
         assert calls[0]["check"] is True
         assert calls[0]["timeout"] == ts.DEFAULT_CLI_TIMEOUT
 
@@ -650,33 +650,48 @@ class TestReloadObsidian:
 
 
 # --------------------------------------------------------------------------
-# ensure_cli_enabled (enable_cli.py)
+# init-obsidian-cli oneshot (s6-rc service)
 # --------------------------------------------------------------------------
+
+ONESHOT_RUN = (
+    Path(__file__).resolve().parent.parent
+    / "root/etc/s6-overlay/s6-rc.d/init-obsidian-cli/run"
+)
+
 
 def read_global_config(home: Path) -> dict:
     return json.loads((home / ".config" / "obsidian" / "obsidian.json").read_text(encoding="utf-8"))
 
 
-class TestEnsureCliEnabled:
+def run_oneshot(home: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", str(ONESHOT_RUN)],
+        env={**os.environ, "OBSIDIAN_HOME": str(home)},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+
+class TestInitObsidianCliOneshot:
     def test_creates_config_with_cli_enabled(self, tmp_path: Path) -> None:
         # Given a fresh home directory without any Obsidian config
-        # When the CLI is enabled at boot
-        path = ec.ensure_cli_enabled(str(tmp_path))
+        # When the oneshot runs at boot
+        run_oneshot(tmp_path)
         # Then the global config exists with the CLI enabled
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        data = read_global_config(tmp_path)
         assert data["cli"] is True
         assert data["frame"] == "native"
         assert data["updateDisabled"] is True
 
     def test_preserves_existing_user_keys(self, tmp_path: Path) -> None:
         # Given an existing global config with user settings
-        (tmp_path / ".config" / "obsidian").mkdir(parents=True)
-        (tmp_path / ".config" / "obsidian" / "obsidian.json").write_text(
-            json.dumps({"frame": "frameless", "updateDisabled": False, "vaults": {"a": 1}}),
-            encoding="utf-8",
+        write_global_config(
+            tmp_path,
+            {"frame": "frameless", "updateDisabled": False, "vaults": {"a": 1}},
         )
-        # When the CLI is enabled at boot
-        ec.ensure_cli_enabled(str(tmp_path))
+        # When the oneshot runs at boot
+        run_oneshot(tmp_path)
         # Then the user settings survive and only cli is added
         data = read_global_config(tmp_path)
         assert data["cli"] is True
@@ -686,30 +701,25 @@ class TestEnsureCliEnabled:
 
     def test_explicit_cli_false_is_respected(self, tmp_path: Path) -> None:
         # Given a user that explicitly disabled the CLI
-        (tmp_path / ".config" / "obsidian").mkdir(parents=True)
-        (tmp_path / ".config" / "obsidian" / "obsidian.json").write_text(
-            json.dumps({"cli": False}), encoding="utf-8"
-        )
-        # When the CLI is enabled at boot
-        ec.ensure_cli_enabled(str(tmp_path))
+        write_global_config(tmp_path, {"cli": False})
+        # When the oneshot runs at boot
+        run_oneshot(tmp_path)
         # Then the explicit choice is not overridden
         assert read_global_config(tmp_path)["cli"] is False
 
     def test_corrupt_config_is_replaced(self, tmp_path: Path) -> None:
         # Given a global config that is not valid JSON
-        (tmp_path / ".config" / "obsidian").mkdir(parents=True)
-        (tmp_path / ".config" / "obsidian" / "obsidian.json").write_text("{broken", encoding="utf-8")
-        # When the CLI is enabled at boot
-        ec.ensure_cli_enabled(str(tmp_path))
+        write_global_config(tmp_path, Ellipsis)
+        # When the oneshot runs at boot
+        run_oneshot(tmp_path)
         # Then the file is replaced with valid defaults
         assert read_global_config(tmp_path)["cli"] is True
 
     def test_non_object_config_is_replaced(self, tmp_path: Path) -> None:
         # Given a global config that is a JSON array
-        (tmp_path / ".config" / "obsidian").mkdir(parents=True)
-        (tmp_path / ".config" / "obsidian" / "obsidian.json").write_text("[1, 2]", encoding="utf-8")
-        # When the CLI is enabled at boot
-        ec.ensure_cli_enabled(str(tmp_path))
+        write_global_config(tmp_path, [1, 2])
+        # When the oneshot runs at boot
+        run_oneshot(tmp_path)
         # Then the file is replaced with an object carrying the defaults
         data = read_global_config(tmp_path)
         assert data["cli"] is True
@@ -717,28 +727,29 @@ class TestEnsureCliEnabled:
 
     def test_idempotent(self, tmp_path: Path) -> None:
         # Given a config already written by a previous boot
-        ec.ensure_cli_enabled(str(tmp_path))
-        first = (tmp_path / ".config" / "obsidian" / "obsidian.json").read_text(encoding="utf-8")
-        # When the CLI is enabled again
-        ec.ensure_cli_enabled(str(tmp_path))
+        run_oneshot(tmp_path)
+        config_path = tmp_path / ".config" / "obsidian" / "obsidian.json"
+        first = config_path.read_text(encoding="utf-8")
+        # When the oneshot runs again
+        run_oneshot(tmp_path)
         # Then the content is unchanged
-        assert (tmp_path / ".config" / "obsidian" / "obsidian.json").read_text(encoding="utf-8") == first
+        assert config_path.read_text(encoding="utf-8") == first
 
     def test_no_temp_file_left_behind(self, tmp_path: Path) -> None:
         # Given a fresh home directory
-        # When the CLI is enabled at boot
-        ec.ensure_cli_enabled(str(tmp_path))
+        # When the oneshot runs at boot
+        run_oneshot(tmp_path)
         # Then no temporary files remain
-        leftovers = [p.name for p in (tmp_path / ".config" / "obsidian").iterdir() if p.name.startswith(".obsidian-")]
+        config_dir = tmp_path / ".config" / "obsidian"
+        leftovers = [p.name for p in config_dir.iterdir() if p.name.startswith(".obsidian-")]
         assert leftovers == []
 
-    def test_unwritable_home_raises(self, tmp_path: Path) -> None:
+    def test_blocked_config_directory_fails(self, tmp_path: Path) -> None:
         # Given a home path where the config directory cannot be created (a file in the way)
-        blocker = tmp_path / ".config"
-        blocker.write_text("file", encoding="utf-8")
-        # When the CLI is enabled at boot
-        with pytest.raises(OSError):
-            ec.ensure_cli_enabled(str(tmp_path))
+        (tmp_path / ".config").write_text("file", encoding="utf-8")
+        # When the oneshot runs at boot
+        with pytest.raises(subprocess.CalledProcessError):
+            run_oneshot(tmp_path)
 
 
 # --------------------------------------------------------------------------

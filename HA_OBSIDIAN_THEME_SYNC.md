@@ -26,7 +26,7 @@ theme_server.py  (s6 service, loopback 127.0.0.1:8090, runs as abc)
   ▼
 <vault>/.obsidian/appearance.json   (atomic write, keys preserved, abc-owned)
   ▼
-obsidian reload  (system CLI, best-effort, only when the value changed)
+obsidian-cli reload  (CLI client, best-effort, only when the value changed)
   ▼
 Obsidian applies the theme live, without restarting the add-on
 ```
@@ -45,11 +45,12 @@ Key properties:
   sources** (see Section 2.3), so they survive the boot-time regeneration.
 - **The vault is resolved per request**: `THEME_SYNC_VAULT` override → most
   recent vault in Obsidian's global config → `/config`.
-- **The running app is reloaded through the Obsidian CLI.** At boot,
-  `enable_cli.py` merges `"cli": true` into the global config (the key the
-  app gates every CLI command on). After an actual theme change the daemon
-  runs `obsidian reload` best-effort; a failed reload never fails the API —
-  the file is correct and the theme applies on the next app start.
+- **The running app is reloaded through the Obsidian CLI.** At boot, the
+  `init-obsidian-cli` s6-rc oneshot merges `"cli": true` into the global
+  config (the key the app gates every CLI command on). After an actual
+  theme change the daemon runs `/opt/obsidian/obsidian-cli reload` best-effort; a failed
+  reload never fails the API — the file is correct and the theme applies on
+  the next app start.
 
 ---
 
@@ -117,9 +118,16 @@ obsidian/
 ├── ha-theme-sync/
 │   ├── theme_server.py                     # daemon (stdlib only)
 │   ├── theme-sync.js                       # client detection
-│   ├── enable_cli.py                       # boot-time CLI enablement
 │   └── test_theme_server.py                # pytest suite (Given-When-Then)
-└── root/etc/services.d/theme-api/run       # s6 longrun service
+└── root/
+    ├── etc/services.d/theme-api/run        # s6 longrun service
+    └── etc/s6-overlay/s6-rc.d/
+        ├── init-obsidian-cli/              # boot-time oneshot: CLI enablement
+        │   ├── type                        # oneshot
+        │   ├── run                         # jq merge script
+        │   ├── up
+        │   └── dependencies.d/init-obsidian-config
+        └── user/contents.d/init-obsidian-cli
 ```
 
 ---
@@ -146,7 +154,7 @@ active vault, safely.
   - `apply_theme()` — validates against the allowlist, preserves unrelated
     keys, writes via temp file + `os.replace` (atomic), chowns best-effort,
     no temp files left behind, corrupt/foreign existing files are replaced.
-  - `reload_obsidian()` — runs `obsidian reload` via
+  - `reload_obsidian()` — runs `/opt/obsidian/obsidian-cli reload` via
     `subprocess.run(check=True, timeout=15)` with explicit
     `HOME`/`XDG_RUNTIME_DIR`; never raises, returns `False` when the CLI or
     the app is unavailable.
@@ -189,13 +197,15 @@ user from the start (matching LSIO's own service pattern).
 
 **Goal.** Make the web UI reach the daemon, durably.
 
-- Copy `theme_server.py` + `theme-sync.js` + `enable_cli.py` to
-  `/opt/ha-theme-sync/`, the s6 service to `/etc/services.d/theme-api/`,
-  and `chmod +x` the run script.
-- Hook `enable_cli.py` into the boot-time `init-obsidian-config` service so
-  `"cli": true` is merged into the global config before the app first reads
+- Copy `theme_server.py` + `theme-sync.js` to `/opt/ha-theme-sync/`, the
+  longrun service to `/etc/services.d/theme-api/`, and `chmod +x` the run
+  script.
+- Install the `init-obsidian-cli` s6-rc oneshot under
+  `/etc/s6-overlay/s6-rc.d/` (type `oneshot`, depending on the base image's
+  `init-obsidian-config`) and add it to the `user` bundle, so `"cli": true`
+  is merged into the global config at every boot before the app first reads
   it (idempotent: preserves user keys, respects an explicit
-  `"cli": false`).
+  `"cli": false`, replaces corrupt or non-object files).
 - Insert into the nginx **template** `/defaults/default.conf` (both server
   blocks, anchored on `location SUBFOLDER {`):
   ```nginx
@@ -207,9 +217,10 @@ user from the start (matching LSIO's own service pattern).
   (idempotency-guarded).
 - Grep assertions fail the build if the expected anchors are missing, so a
   future base-image bump cannot silently drop the feature.
-- The existing pinned base and `mkdir /share` steps are kept untouched; the
-  `init-obsidian-config` boot script is only extended with the CLI
-  enablement line.
+- The existing pinned base and `mkdir /share` steps are kept untouched, and
+  the base image's `init-obsidian-config` service is not modified — the CLI
+  enablement lives in our own oneshot service, so a failure there can no
+  longer mark the base image's service as failed.
 
 **Verify.** `docker build` succeeds; after boot, the live config contains
 both locations (Section 6).
@@ -246,7 +257,7 @@ on the run script.
    `"theme": "moonstone"`, owned by the add-on user, other keys intact.
 5. **Live apply:** switch the HA theme and confirm the running Obsidian
    follows within ~15 s *without* restarting the add-on — the API response
-   shows `"reloaded": true` when `obsidian reload` succeeded. If
+   shows `"reloaded": true` when `obsidian-cli reload` succeeded. If
    `"reloaded"` is `false` (CLI unavailable), restart the app once — the
    file is already correct, so the theme applies on next start.
 6. **Failure modes:**
@@ -259,4 +270,4 @@ on the run script.
    - *`"reloaded": false` in the API response* → the CLI gate is closed or
      the app is not running: check `"cli": true` in
      `/config/.config/obsidian/obsidian.json` and run
-     `s6-setuidgid abc obsidian help` to see the CLI error text.
+     `s6-setuidgid abc /opt/obsidian/obsidian-cli help` to see the CLI error text.

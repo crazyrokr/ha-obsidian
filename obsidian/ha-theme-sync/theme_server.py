@@ -26,7 +26,9 @@ DEFAULT_BIND_PORT = 8090
 DEFAULT_OBSIDIAN_HOME = "/config"
 DEFAULT_VAULT = "/config"
 VAULT_ENV_VAR = "THEME_SYNC_VAULT"
-DEFAULT_CLI_COMMAND = ("obsidian", "reload")
+# The CLI client binary, not the `obsidian` on PATH: in the base image the
+# latter is the app launcher, so a relative name would start a second app.
+DEFAULT_CLI_COMMAND = ("/opt/obsidian/obsidian-cli", "reload")
 DEFAULT_CLI_TIMEOUT = 15.0
 
 _RGB_FN = re.compile(
