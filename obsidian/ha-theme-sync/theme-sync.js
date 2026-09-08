@@ -2,11 +2,19 @@
  * theme. Runs in the add-on web UI: when embedded via HA ingress the parent
  * window is same-origin and HA's theme variables are readable; otherwise the
  * browser color scheme is used as the fallback.
+ *
+ * Re-syncs are event-driven, not polled. The prefers-color-scheme change
+ * event covers the fallback, and a MutationObserver on the parent document
+ * covers HA theme switches: every way those CSS variables change (a `theme`
+ * attribute, inline custom properties, class toggles, stylesheet swaps)
+ * surfaces as a DOM mutation. A failed send is retried a bounded number of
+ * times, so a transient error at the moment of a switch cannot lose the sync.
  */
 (function () {
   "use strict";
 
-  var RE_SYNC_MS = 15000;
+  var RETRY_DELAY_MS = 2000;
+  var MAX_ATTEMPTS = 3;
 
   function parseColor(value) {
     if (typeof value !== "string") return null;
@@ -65,6 +73,10 @@
     return "moonstone";
   }
 
+  function currentTheme() {
+    return parentTheme() || localTheme();
+  }
+
   /* The page is served under the ingress path (/api/ingress/<token>) when
    * embedded, so the endpoint must be derived from the page location instead
    * of a hardcoded absolute path. Captured once at load time, before any
@@ -76,22 +88,90 @@
   })();
 
   var lastSent = null;
+  var consecutiveFailures = 0;
 
+  /* Event-driven entry point: scheme changes and parent mutations. A fresh
+   * event starts a fresh delivery budget.
+   */
   function sync() {
-    var theme = parentTheme() || localTheme();
+    consecutiveFailures = 0;
+    attemptDelivery();
+  }
+
+  function attemptDelivery() {
+    var theme = currentTheme();
     if (theme === lastSent) return;
     lastSent = theme;
     fetch(endpoint + "?theme=" + encodeURIComponent(theme), { method: "POST" })
       .then(function (response) {
-        if (response.ok) return;
+        if (response.ok) {
+          consecutiveFailures = 0;
+          return;
+        }
         if (response.status === 404) return;
-        lastSent = null;
+        scheduleRetry();
       })
       .catch(function () {
-        lastSent = null;
+        scheduleRetry();
       });
   }
 
+  /* Bounded retry chain for failed sends; re-reads the theme on every
+   * attempt, so it always delivers the current state.
+   */
+  function scheduleRetry() {
+    lastSent = null;
+    consecutiveFailures += 1;
+    if (consecutiveFailures >= MAX_ATTEMPTS) return;
+    setTimeout(function () {
+      attemptDelivery();
+    }, RETRY_DELAY_MS);
+  }
+
+  /* The fallback path: the browser color scheme. MediaQueryList fires a
+   * change event exactly when it flips, so no polling is needed.
+   */
+  function watchColorScheme() {
+    var media;
+    try {
+      media = window.matchMedia("(prefers-color-scheme: dark)");
+    } catch (error) {
+      return;
+    }
+    if (!media) return;
+    if (typeof media.addEventListener === "function") {
+      media.addEventListener("change", sync);
+    } else if (typeof media.addListener === "function") {
+      media.addListener(sync); // legacy Safari
+    }
+  }
+
+  /* The HA path: there is no "CSS variable changed" event, but every
+   * mechanism that changes the watched variables (a `theme`/class attribute
+   * on <html>, inline custom properties on :root, <style>/<link> swaps in
+   * <head>, class toggles anywhere) is a DOM mutation on the parent
+   * document, so a MutationObserver on its root sees them all. sync() is a
+   * cheap read plus a guarded fetch, so unfiltered parent churn is harmless.
+   */
+  function watchParentTheme() {
+    try {
+      var parentWindow = window.parent;
+      if (!parentWindow || parentWindow === window) return;
+      if (typeof parentWindow.MutationObserver !== "function") return;
+      var root = parentWindow.document.documentElement;
+      if (!root) return;
+      new parentWindow.MutationObserver(sync).observe(root, {
+        attributes: true,
+        attributeFilter: ["theme", "class", "style", "data-theme"],
+        childList: true,
+        subtree: true
+      });
+    } catch (error) {
+      /* Cross-origin or restricted parent: only the scheme fallback exists. */
+    }
+  }
+
+  watchColorScheme();
+  watchParentTheme();
   sync();
-  setInterval(sync, RE_SYNC_MS);
 })();

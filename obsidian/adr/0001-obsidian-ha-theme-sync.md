@@ -39,8 +39,14 @@ detects the HA theme and posts it to the daemon through nginx.
    the parent window, parses the color, and compares WCAG relative
    luminance against 0.5. This works for the stock HA themes and any custom
    theme. When the parent window is not accessible (standalone tab), the
-   browser `prefers-color-scheme` is used. Detection runs on load and
-   re-checks every 15 s so runtime theme switches are picked up.
+   browser `prefers-color-scheme` is used. Detection runs on load and is
+   then event-driven: the `prefers-color-scheme` change event covers the
+   fallback, and a `MutationObserver` on the parent document covers HA
+   theme switches — every way those CSS variables change (an attribute on
+   `<html>`, an inline custom property, a class toggle, a stylesheet
+   swap) surfaces as a DOM mutation, so no polling is needed. A failed
+   send is retried a bounded number of times (3 attempts, 2 s apart)
+   instead of being waited out on the next poll.
 2. **The endpoint is derived from the page location, not hardcoded.**
    Under ingress the page URL is `https://<ha>/api/ingress/<token>...`, so a
    hardcoded `/api/set-theme` would hit HA core instead of the add-on. The

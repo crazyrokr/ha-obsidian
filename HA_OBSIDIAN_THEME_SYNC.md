@@ -173,10 +173,23 @@ active vault, safely.
   `--clear-background-color` / `--primary-background-color` from
   `window.parent`; cross-origin failures degrade to `prefers-color-scheme`.
 - Endpoint built from `window.location` (ingress-safe, see Section 1).
-- Runs on load and re-checks every 15 s, so runtime HA theme switches are
-  picked up; repeats a failed send on the next tick.
+- Runs on load, then event-driven (no periodic polling): the
+  `prefers-color-scheme` change event covers the fallback path, and a
+  `MutationObserver` on the parent document covers HA runtime theme
+  switches — every mechanism that changes those CSS variables (`theme`/
+  class attributes on `<html>`, inline custom properties, stylesheet
+  swaps) surfaces as a DOM mutation. The `lastSent` guard suppresses
+  duplicate sends when the resolved theme is unchanged.
+- A failed send is retried a bounded number of times (3 attempts, 2 s
+  apart, re-reading the current theme), so a transient error at the moment
+  of a switch cannot lose the sync; 404 responses are not retried.
+- `ha-theme-sync/theme-sync.test.js` — 18 Given-When-Then tests under
+  `node --test` (zero dependencies) that load the real script into a fake
+  browser: spec-faithful `MutationObserver` delivery, `matchMedia` change
+  events, recorded `fetch`/timers.
 
-**Verify.** Served file check (Step 5) + end-to-end smoke test (Section 6).
+**Verify.** `node --test ha-theme-sync/theme-sync.test.js` all green;
+served file check (Step 5) + end-to-end smoke test (Section 6).
 
 ### Step 3 — s6 service (`root/etc/services.d/theme-api/run`)
 
@@ -234,8 +247,12 @@ both locations (Section 6).
   parsing edge cases, threshold boundaries, vault resolution fall-throughs,
   atomicity, ownership, CLI reload success/failure paths, CLI enablement
   merges, API status codes and idempotency.
+- `ha-theme-sync/theme-sync.test.js` — the client's event-driven behavior
+  (scheme change, parent mutations, guard, bounded retries, no polling)
+  under `node --test` with a fake browser.
 
-**Verify.** `python3 -m pytest ha-theme-sync/ -v` all green; `shellcheck`
+**Verify.** `python3 -m pytest ha-theme-sync/ -v` all green;
+`node --test ha-theme-sync/theme-sync.test.js` all green; `shellcheck`
 on the run script.
 
 ---
@@ -256,8 +273,9 @@ on the run script.
 4. **Vault file:** `cat <vault>/.obsidian/appearance.json` shows
    `"theme": "moonstone"`, owned by the add-on user, other keys intact.
 5. **Live apply:** switch the HA theme and confirm the running Obsidian
-   follows within ~15 s *without* restarting the add-on — the API response
-   shows `"reloaded": true` when `obsidian-cli reload` succeeded. If
+   follows *immediately* (event-driven, no poll wait) *without* restarting
+   the add-on — the API response shows `"reloaded": true` when
+   `obsidian-cli reload` succeeded. If
    `"reloaded"` is `false` (CLI unavailable), restart the app once — the
    file is already correct, so the theme applies on next start.
 6. **Failure modes:**
