@@ -15,7 +15,7 @@ const path = require("node:path");
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
 
-const SCRIPT_PATH = path.join(__dirname, "..", "obsidian", "ha-theme-sync", "theme-sync.js");
+const SCRIPT_PATH = path.join(__dirname, "..", "obsidian", "root", "opt", "ha-theme-sync", "theme-sync.js");
 const ENDPOINT = "https://ha.example.com/api/ingress/t0k3n/api/set-theme";
 
 const THEME_VARS = {

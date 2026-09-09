@@ -2,23 +2,7 @@ FROM lscr.io/linuxserver/obsidian:v1.13.7-ls144@sha256:c6c86336a2cf57506b0db2beb
 
 RUN mkdir /share
 
-# HA theme sync: daemon, client script and s6 services.
-COPY ha-theme-sync/theme_server.py /opt/ha-theme-sync/theme_server.py
-COPY ha-theme-sync/theme-sync.js /opt/ha-theme-sync/theme-sync.js
-COPY root/etc/services.d/theme-api/run /etc/services.d/theme-api/run
-COPY root/etc/s6-overlay/s6-rc.d/init-obsidian-cli /etc/s6-overlay/s6-rc.d/init-obsidian-cli
-COPY root/etc/s6-overlay/s6-rc.d/user/contents.d/init-obsidian-cli \
-     /etc/s6-overlay/s6-rc.d/user/contents.d/init-obsidian-cli
-
-# Boot-time s6-rc oneshot that enables the Obsidian command line interface:
-# an idempotent merge of "cli": true into the global config, preserving user
-# keys, which the daemon needs to run `obsidian reload` after a theme change.
-# It depends on the base image's init-obsidian-config so it runs after
-# /config is chowned.
-RUN bash -n /etc/s6-overlay/s6-rc.d/init-obsidian-cli/run \
- && grep -qx oneshot /etc/s6-overlay/s6-rc.d/init-obsidian-cli/type \
- && test -f /etc/s6-overlay/s6-rc.d/init-obsidian-cli/dependencies.d/init-obsidian-config \
- && test -f /etc/s6-overlay/s6-rc.d/user/contents.d/init-obsidian-cli
+COPY root /
 
 # Durable web hooks: the nginx config and the dashboard are regenerated from
 # /defaults/default.conf and /usr/share/selkies/selkies-dashboard at every

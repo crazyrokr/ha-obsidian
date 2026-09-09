@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "obsidian" / "ha-theme-sync"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "obsidian" / "root" / "opt" / "ha-theme-sync"))
 
 import theme_server as ts  # noqa: E402
 
