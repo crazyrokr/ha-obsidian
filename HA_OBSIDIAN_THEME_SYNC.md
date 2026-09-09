@@ -45,6 +45,15 @@ Key properties:
   sources** (see Section 2.3), so they survive the boot-time regeneration.
 - **The vault is resolved per request**: `THEME_SYNC_VAULT` override → most
   recent vault in Obsidian's global config → `/config`.
+- **Newly created vaults inherit the last requested theme.** First-run
+  installs start with no vault, so the initial sync writes the default
+  location; a vault the user creates later starts with Obsidian's default
+  appearance and would otherwise stay out of sync. The daemon records the
+  last requested theme and runs a background watcher over Obsidian's vault
+  registry: a vault registered after the last request gets the remembered
+  theme applied and the app reloaded — no browser request needed. Vault
+  paths that existed before the watcher started are never overwritten, so a
+  user-chosen custom theme is left untouched.
 - **The running app is reloaded through the Obsidian CLI.** At boot, the
   `init-obsidian-cli` s6-rc oneshot merges `"cli": true` into the global
   config (the key the app gates every CLI command on). After an actual
@@ -159,9 +168,27 @@ active vault, safely.
     `HOME`/`XDG_RUNTIME_DIR`; never raises, returns `False` when the CLI or
     the app is unavailable.
   - `handle_set_theme()` — orchestrates vault/owner resolution,
-    `apply_theme`, then `reload_obsidian` only when the value actually
-    changed; returns `{"changed": bool, "reloaded": bool}`.
-- Runs as a stdlib-only script (`http.server.ThreadingHTTPServer`).
+    `apply_theme`, persists the requested theme for the watcher (even for a
+    no-op request, so the remembered theme is always the last one asked
+    for), then `reload_obsidian` only when the value actually changed;
+    returns `{"changed": bool, "reloaded": bool}`.
+  - `store_last_theme()` / `load_last_theme()` — persist the last requested
+    theme at `<home>/.config/ha-theme-sync.json`; storing is best-effort
+    (a failure only leaves the watcher with nothing to apply), loading
+    returns `None` for a missing, corrupt or disallowed value.
+  - `registered_vaults()` — the existing vault paths recorded in Obsidian's
+    global config; non-dict configs, non-dict entries and non-existent
+    paths are skipped.
+  - `VaultWatcher` / `run_vault_watcher()` — a daemon thread polling the
+    vault registry every 2 s. The first step only records a baseline, so
+    vaults that existed before the watcher started are never overwritten;
+    a newly registered vault gets the remembered theme written (allowlist
+    enforced by `apply_theme`) and, only when something was written, a
+    best-effort `obsidian-cli reload`. A step that raises never stops the
+    loop; polling (not inotify) survives Electron's replace-the-file config
+    rewrites.
+- Runs as a stdlib-only script (`http.server.ThreadingHTTPServer`), with
+  the watcher thread started from `main()`.
 
 **Verify.** `python3 -m pytest ha-theme-sync/ -v` — all green.
 
@@ -243,10 +270,13 @@ both locations (Section 6).
 - `obsidian/adr/0001-obsidian-ha-theme-sync.md` records the decision, the
   rejected alternatives (runtime sed, `apk`, KasmVNC injection, string-based
   detection) and the consequences.
-- `ha-theme-sync/test_theme_server.py` — 70+ Given-When-Then tests covering
+- `ha-theme-sync/test_theme_server.py` — 120 Given-When-Then tests covering
   parsing edge cases, threshold boundaries, vault resolution fall-throughs,
   atomicity, ownership, CLI reload success/failure paths, CLI enablement
-  merges, API status codes and idempotency.
+  merges, API status codes and idempotency, the remembered-theme state
+  (round-trip, allowlist, corruption, swallowed failures) and the vault
+  watcher (baseline, new-vault sync, re-creation after removal, corrupt
+  config, no-op registries, multi-vault reload coalescing, loop survival).
 - `ha-theme-sync/theme-sync.test.js` — the client's event-driven behavior
   (scheme change, parent mutations, guard, bounded retries, no polling)
   under `node --test` with a fake browser.
@@ -289,3 +319,13 @@ on the run script.
      the app is not running: check `"cli": true` in
      `/config/.config/obsidian/obsidian.json` and run
      `s6-setuidgid abc /opt/obsidian/obsidian-cli help` to see the CLI error text.
+   - *A newly created vault stays at the default theme* → the daemon
+     watcher applies the remembered theme to vaults registered after the
+     last request, within about 2 s. Check that
+     `/config/.config/ha-theme-sync.json` exists (it is only written after
+     the first `/api/set-theme` request — until then there is nothing to
+     apply), that the vault is listed in
+     `/config/.config/obsidian/obsidian.json`, and that `theme-api` is up.
+     Vault paths that already existed when the daemon started — including
+     ones created before a daemon restart — are left as-is by design,
+     including user-chosen custom themes.

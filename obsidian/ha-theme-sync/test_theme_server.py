@@ -176,7 +176,7 @@ class TestIsDarkColor:
 
 def write_global_config(home: Path, payload: object) -> None:
     config_dir = home / ".config" / "obsidian"
-    config_dir.mkdir(parents=True)
+    config_dir.mkdir(parents=True, exist_ok=True)
     (config_dir / "obsidian.json").write_text(
         "not json" if payload is Ellipsis else json.dumps(payload), encoding="utf-8"
     )
@@ -329,6 +329,14 @@ def appearance(vault: Path) -> Path:
     return vault / ".obsidian" / "appearance.json"
 
 
+def state_file(home: Path) -> Path:
+    return home / ".config" / "ha-theme-sync.json"
+
+
+def register_vault(home: Path, vault: Path, index: str = "v") -> None:
+    write_global_config(home, {"vaults": {index: {"path": str(vault), "ts": 1}}})
+
+
 class TestApplyTheme:
     def test_creates_appearance_file(self, tmp_path: Path) -> None:
         # Given a vault without an .obsidian folder
@@ -438,6 +446,83 @@ class TestApplyTheme:
 
 
 # --------------------------------------------------------------------------
+# last-theme state
+# --------------------------------------------------------------------------
+
+
+class TestLastThemeState:
+    def test_store_and_load_roundtrip(self, tmp_path: Path) -> None:
+        # Given a fresh home directory
+        # When a theme is stored
+        ts.store_last_theme("moonstone", str(tmp_path))
+        # Then the same theme is read back
+        assert ts.load_last_theme(str(tmp_path)) == "moonstone"
+
+    def test_stored_theme_is_plain_json(self, tmp_path: Path) -> None:
+        # Given a fresh home directory
+        ts.store_last_theme("obsidian", str(tmp_path))
+        # When the state file is read
+        data = json.loads(state_file(tmp_path).read_text(encoding="utf-8"))
+        # Then it carries only the theme
+        assert data == {"theme": "obsidian"}
+
+    def test_store_overwrites_previous_theme(self, tmp_path: Path) -> None:
+        # Given a stored theme
+        ts.store_last_theme("moonstone", str(tmp_path))
+        # When another theme is stored
+        ts.store_last_theme("obsidian", str(tmp_path))
+        # Then the newest one is read back
+        assert ts.load_last_theme(str(tmp_path)) == "obsidian"
+
+    def test_store_ignores_disallowed_theme(self, tmp_path: Path) -> None:
+        # Given a theme outside the allowlist
+        ts.store_last_theme("purple", str(tmp_path))
+        # When the state is loaded
+        assert ts.load_last_theme(str(tmp_path)) is None
+
+    def test_store_leaves_no_temp_files(self, tmp_path: Path) -> None:
+        # Given a fresh home directory
+        ts.store_last_theme("moonstone", str(tmp_path))
+        # When the config directory is inspected
+        leftovers = [p.name for p in (tmp_path / ".config").iterdir() if p.name.startswith(".")]
+        assert leftovers == []
+
+    def test_load_without_state_returns_none(self, tmp_path: Path) -> None:
+        # Given no state file
+        # When the state is loaded
+        assert ts.load_last_theme(str(tmp_path)) is None
+
+    def test_load_corrupt_state_returns_none(self, tmp_path: Path) -> None:
+        # Given a state file that is not valid JSON
+        state_file(tmp_path).parent.mkdir(parents=True)
+        state_file(tmp_path).write_text("{broken", encoding="utf-8")
+        # When the state is loaded
+        assert ts.load_last_theme(str(tmp_path)) is None
+
+    def test_load_non_object_state_returns_none(self, tmp_path: Path) -> None:
+        # Given a state file that is a JSON list
+        state_file(tmp_path).parent.mkdir(parents=True)
+        state_file(tmp_path).write_text("[1, 2]", encoding="utf-8")
+        # When the state is loaded
+        assert ts.load_last_theme(str(tmp_path)) is None
+
+    def test_load_disallowed_theme_returns_none(self, tmp_path: Path) -> None:
+        # Given a state file whose theme is outside the allowlist
+        state_file(tmp_path).parent.mkdir(parents=True)
+        state_file(tmp_path).write_text(json.dumps({"theme": "purple"}), encoding="utf-8")
+        # When the state is loaded
+        assert ts.load_last_theme(str(tmp_path)) is None
+
+    def test_store_failure_is_swallowed(self, tmp_path: Path) -> None:
+        # Given a home where the config directory cannot be created (a file in the way)
+        (tmp_path / ".config").write_text("file", encoding="utf-8")
+        # When a theme is stored
+        ts.store_last_theme("moonstone", str(tmp_path))  # must not raise
+        # Then nothing propagates to the caller and no state was read back
+        assert ts.load_last_theme(str(tmp_path)) is None
+
+
+# --------------------------------------------------------------------------
 # handle_set_theme
 # --------------------------------------------------------------------------
 
@@ -448,11 +533,45 @@ class TestHandleSetTheme:
         vault.mkdir()
         # When the theme is requested
         result = ts.handle_set_theme(
-            "obsidian", env={"THEME_SYNC_VAULT": str(vault)}, reloder=lambda **kw: True
+            "obsidian",
+            env={"THEME_SYNC_VAULT": str(vault)},
+            obsidian_home=str(tmp_path),
+            reloder=lambda **kw: True,
         )
         # Then it is written to that vault
         assert result == {"changed": True, "reloaded": True}
         assert json.loads(appearance(vault).read_text(encoding="utf-8"))["theme"] == "obsidian"
+
+    def test_request_persists_remembered_theme(self, tmp_path: Path) -> None:
+        # Given a vault and a fresh home directory
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        # When the theme is requested
+        ts.handle_set_theme(
+            "moonstone",
+            env={"THEME_SYNC_VAULT": str(vault)},
+            obsidian_home=str(tmp_path),
+            reloder=lambda **kw: True,
+        )
+        # Then the theme is remembered for the vault watcher
+        assert ts.load_last_theme(str(tmp_path)) == "moonstone"
+
+    def test_noop_request_refreshes_remembered_theme(self, tmp_path: Path) -> None:
+        # Given a vault that already has the requested theme and a stale memory
+        vault = tmp_path / "vault"
+        appearance(vault).parent.mkdir(parents=True)
+        appearance(vault).write_text(json.dumps({"theme": "obsidian"}), encoding="utf-8")
+        ts.store_last_theme("moonstone", str(tmp_path))
+        # When the same theme is requested again
+        result = ts.handle_set_theme(
+            "obsidian",
+            env={"THEME_SYNC_VAULT": str(vault)},
+            obsidian_home=str(tmp_path),
+            reloder=lambda **kw: True,
+        )
+        # Then the request is a no-op but the remembered theme is refreshed
+        assert result == {"changed": False, "reloaded": False}
+        assert ts.load_last_theme(str(tmp_path)) == "obsidian"
 
     def test_missing_theme_rejected(self, tmp_path: Path) -> None:
         # Given no theme value
@@ -484,8 +603,12 @@ class TestHandleSetTheme:
             return True
 
         # When the theme is applied twice
-        first = ts.handle_set_theme("obsidian", env=env, reloder=reloder)
-        second = ts.handle_set_theme("obsidian", env=env, reloder=reloder)
+        first = ts.handle_set_theme(
+            "obsidian", env=env, obsidian_home=str(tmp_path), reloder=reloder
+        )
+        second = ts.handle_set_theme(
+            "obsidian", env=env, obsidian_home=str(tmp_path), reloder=reloder
+        )
         # Then the reloader runs only for the first (changed) write
         assert first == {"changed": True, "reloaded": True}
         assert second == {"changed": False, "reloaded": False}
@@ -502,7 +625,12 @@ class TestHandleSetTheme:
             return True
 
         # When the theme is applied
-        ts.handle_set_theme("moonstone", env={"THEME_SYNC_VAULT": str(vault)}, reloder=reloder)
+        ts.handle_set_theme(
+            "moonstone",
+            env={"THEME_SYNC_VAULT": str(vault)},
+            obsidian_home=str(tmp_path),
+            reloder=reloder,
+        )
         # Then the request environment is passed through
         assert captured["THEME_SYNC_VAULT"] == str(vault)
 
@@ -512,7 +640,10 @@ class TestHandleSetTheme:
         vault.mkdir()
         # When the theme is applied
         result = ts.handle_set_theme(
-            "moonstone", env={"THEME_SYNC_VAULT": str(vault)}, reloder=lambda **kw: False
+            "moonstone",
+            env={"THEME_SYNC_VAULT": str(vault)},
+            obsidian_home=str(tmp_path),
+            reloder=lambda **kw: False,
         )
         # Then the change stands and the reload is reported as failed
         assert result == {"changed": True, "reloaded": False}
@@ -527,7 +658,12 @@ class TestHandleSetTheme:
             raise RuntimeError("cli exploded")
 
         # When the theme is applied
-        result = ts.handle_set_theme("obsidian", env={"THEME_SYNC_VAULT": str(vault)}, reloder=reloder)
+        result = ts.handle_set_theme(
+            "obsidian",
+            env={"THEME_SYNC_VAULT": str(vault)},
+            obsidian_home=str(tmp_path),
+            reloder=reloder,
+        )
         # Then the change stands and the error is contained
         assert result == {"changed": True, "reloaded": False}
         assert json.loads(appearance(vault).read_text(encoding="utf-8"))["theme"] == "obsidian"
@@ -647,6 +783,288 @@ class TestReloadObsidian:
         result = ts.reload_obsidian(env={})
         # Then the failure is reported, not raised
         assert result is False
+
+
+# --------------------------------------------------------------------------
+# registered_vaults
+# --------------------------------------------------------------------------
+
+
+class TestRegisteredVaults:
+    def test_collects_paths_of_existing_vaults(self, tmp_path: Path) -> None:
+        # Given two vaults recorded in the global config
+        first = tmp_path / "first"
+        second = tmp_path / "second"
+        first.mkdir()
+        second.mkdir()
+        data = {
+            "vaults": {
+                "a": {"path": str(first), "ts": 1},
+                "b": {"path": str(second), "ts": 2},
+            }
+        }
+        # When the registry is read
+        result = ts.registered_vaults(data)
+        # Then both existing paths are listed
+        assert result == {str(first), str(second)}
+
+    def test_skips_paths_that_do_not_exist(self, tmp_path: Path) -> None:
+        # Given a recorded vault whose path is absent on disk
+        data = {"vaults": {"a": {"path": str(tmp_path / "gone"), "ts": 1}}}
+        # When the registry is read
+        assert ts.registered_vaults(data) == set()
+
+    def test_skips_malformed_entries(self, tmp_path: Path) -> None:
+        # Given a mix of valid and invalid registry entries
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        data = {"vaults": {"a": "junk", "b": {"ts": 9}, "c": {"path": str(vault), "ts": 1}}}
+        # When the registry is read
+        assert ts.registered_vaults(data) == {str(vault)}
+
+    @pytest.mark.parametrize(
+        "data",
+        [None, 42, "text", [1], {"vaults": "junk"}, {"vaults": None}, {}],
+    )
+    def test_non_dict_inputs_yield_empty_registry(self, data: object) -> None:
+        # Given a global config that is not an object with a vault map
+        # When the registry is read
+        assert ts.registered_vaults(data) == set()
+
+
+# --------------------------------------------------------------------------
+# VaultWatcher (new-vault synchronization)
+# --------------------------------------------------------------------------
+
+
+class TestVaultWatcher:
+    def test_new_vault_receives_remembered_theme(self, tmp_path: Path) -> None:
+        # Given a remembered theme and a baseline registry
+        ts.store_last_theme("moonstone", str(tmp_path))
+        watcher = ts.VaultWatcher(home=str(tmp_path), reloder=lambda **kw: True)
+        watcher.step()
+        # When the user creates a vault
+        vault = tmp_path / "new-vault"
+        vault.mkdir()
+        register_vault(tmp_path, vault)
+        # And the watcher steps
+        changed = watcher.step()
+        # Then the new vault carries the remembered theme
+        assert changed == 1
+        assert json.loads(appearance(vault).read_text(encoding="utf-8"))["theme"] == "moonstone"
+
+    def test_existing_vaults_are_never_overwritten(self, tmp_path: Path) -> None:
+        # Given a vault that existed before the watcher, with its own theme choice
+        vault = tmp_path / "old"
+        appearance(vault).parent.mkdir(parents=True)
+        appearance(vault).write_text(json.dumps({"theme": "custom"}), encoding="utf-8")
+        register_vault(tmp_path, vault)
+        ts.store_last_theme("moonstone", str(tmp_path))
+        watcher = ts.VaultWatcher(home=str(tmp_path), reloder=lambda **kw: True)
+        # When the watcher steps with the registry unchanged
+        watcher.step()
+        watcher.step()
+        # Then the pre-existing vault keeps its theme
+        assert json.loads(appearance(vault).read_text(encoding="utf-8"))["theme"] == "custom"
+
+    def test_without_remembered_theme_nothing_is_written(self, tmp_path: Path) -> None:
+        # Given no remembered theme (no request was ever made)
+        watcher = ts.VaultWatcher(home=str(tmp_path), reloder=lambda **kw: True)
+        watcher.step()
+        # When a vault appears
+        vault = tmp_path / "new-vault"
+        vault.mkdir()
+        register_vault(tmp_path, vault)
+        changed = watcher.step()
+        # Then no appearance file is created
+        assert changed == 0
+        assert not appearance(vault).exists()
+
+    def test_unchanged_registry_is_a_noop(self, tmp_path: Path) -> None:
+        # Given a remembered theme and a stable registry
+        ts.store_last_theme("obsidian", str(tmp_path))
+        calls: list[dict] = []
+
+        def reloder(**kwargs: object) -> bool:
+            calls.append(kwargs)
+            return True
+
+        watcher = ts.VaultWatcher(home=str(tmp_path), reloder=reloder)
+        watcher.step()
+        # When the registry stays the same
+        assert watcher.step() == 0
+        # Then nothing was written and the app was not reloaded
+        assert calls == []
+
+    def test_removal_then_recreation_reapplies(self, tmp_path: Path) -> None:
+        # Given a vault that was synchronized once
+        ts.store_last_theme("obsidian", str(tmp_path))
+        watcher = ts.VaultWatcher(home=str(tmp_path), reloder=lambda **kw: True)
+        watcher.step()
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        register_vault(tmp_path, vault)
+        assert watcher.step() == 1
+        # When the vault leaves the registry and is recreated
+        write_global_config(tmp_path, {"vaults": {}})
+        watcher.step()
+        appearance(vault).unlink()
+        register_vault(tmp_path, vault)
+        # Then the remembered theme is applied again
+        assert watcher.step() == 1
+        assert json.loads(appearance(vault).read_text(encoding="utf-8"))["theme"] == "obsidian"
+
+    def test_corrupt_global_config_is_ignored(self, tmp_path: Path) -> None:
+        # Given a global config that is not valid JSON
+        write_global_config(tmp_path, Ellipsis)
+        ts.store_last_theme("moonstone", str(tmp_path))
+        watcher = ts.VaultWatcher(home=str(tmp_path), reloder=lambda **kw: True)
+        # When the watcher steps repeatedly
+        assert watcher.step() == 0
+        assert watcher.step() == 0
+        # Then no error escapes and no vault is derived from the corrupt file
+
+    def test_new_vault_already_at_theme_skips_reload(self, tmp_path: Path) -> None:
+        # Given a new vault that already carries the remembered theme
+        ts.store_last_theme("moonstone", str(tmp_path))
+        calls: list[dict] = []
+
+        def reloder(**kwargs: object) -> bool:
+            calls.append(kwargs)
+            return True
+
+        watcher = ts.VaultWatcher(home=str(tmp_path), reloder=reloder)
+        watcher.step()
+        vault = tmp_path / "new-vault"
+        appearance(vault).parent.mkdir(parents=True)
+        appearance(vault).write_text(json.dumps({"theme": "moonstone"}), encoding="utf-8")
+        register_vault(tmp_path, vault)
+        # When the watcher steps
+        assert watcher.step() == 0
+        # Then the app was not reloaded
+        assert calls == []
+
+    def test_multiple_new_vaults_trigger_one_reload(self, tmp_path: Path) -> None:
+        # Given a remembered theme and two vaults created at once
+        ts.store_last_theme("obsidian", str(tmp_path))
+        calls: list[dict] = []
+
+        def reloder(**kwargs: object) -> bool:
+            calls.append(kwargs)
+            return True
+
+        watcher = ts.VaultWatcher(home=str(tmp_path), reloder=reloder)
+        watcher.step()
+        first = tmp_path / "one"
+        second = tmp_path / "two"
+        first.mkdir()
+        second.mkdir()
+        write_global_config(
+            tmp_path,
+            {"vaults": {"a": {"path": str(first), "ts": 1}, "b": {"path": str(second), "ts": 2}}},
+        )
+        # When the watcher steps
+        assert watcher.step() == 2
+        # Then both vaults were written and the app reloaded exactly once
+        assert len(calls) == 1
+
+    def test_reload_receives_environment(self, tmp_path: Path) -> None:
+        # Given a watcher with a request-like environment
+        captured: dict = {}
+
+        def reloder(**kwargs: object) -> bool:
+            captured.update(kwargs)
+            return True
+
+        ts.store_last_theme("moonstone", str(tmp_path))
+        watcher = ts.VaultWatcher(
+            home=str(tmp_path), env={"THEME_SYNC_VAULT": "/v"}, reloder=reloder
+        )
+        watcher.step()
+        vault = tmp_path / "new-vault"
+        vault.mkdir()
+        register_vault(tmp_path, vault)
+        watcher.step()
+        # Then the environment was handed to the reloader
+        assert captured["env"]["THEME_SYNC_VAULT"] == "/v"
+
+    def test_reload_exception_is_contained(self, tmp_path: Path) -> None:
+        # Given a reloader that blows up
+        def reloder(**kwargs: object) -> bool:
+            raise RuntimeError("cli exploded")
+
+        ts.store_last_theme("obsidian", str(tmp_path))
+        watcher = ts.VaultWatcher(home=str(tmp_path), reloder=reloder)
+        watcher.step()
+        vault = tmp_path / "new-vault"
+        vault.mkdir()
+        register_vault(tmp_path, vault)
+        # When the watcher steps
+        assert watcher.step() == 1
+        # Then the write stands and nothing is raised
+        assert json.loads(appearance(vault).read_text(encoding="utf-8"))["theme"] == "obsidian"
+
+
+class TestRunVaultWatcher:
+    def test_loop_steps_until_stopped(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Given a watcher that records its steps
+        import threading
+        import time
+
+        steps: list[int] = []
+
+        class FakeWatcher:
+            def __init__(self, **kwargs: object) -> None:
+                pass
+
+            def step(self) -> int:
+                steps.append(1)
+                return 0
+
+        monkeypatch.setattr(ts, "VaultWatcher", FakeWatcher)
+        stop = threading.Event()
+        worker = threading.Thread(
+            target=ts.run_vault_watcher,
+            kwargs={"home": str(tmp_path), "interval": 0.01, "stop": stop},
+            daemon=True,
+        )
+        # When the loop runs briefly and is stopped
+        worker.start()
+        time.sleep(0.1)
+        stop.set()
+        worker.join(timeout=2)
+        # Then it stepped at least once and exited
+        assert not worker.is_alive()
+        assert len(steps) >= 1
+
+    def test_step_failure_does_not_stop_the_loop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Given a watcher whose step raises
+        import threading
+        import time
+
+        class ExplodingWatcher:
+            def __init__(self, **kwargs: object) -> None:
+                pass
+
+            def step(self) -> int:
+                raise RuntimeError("boom")
+
+        monkeypatch.setattr(ts, "VaultWatcher", ExplodingWatcher)
+        stop = threading.Event()
+        worker = threading.Thread(
+            target=ts.run_vault_watcher,
+            kwargs={"home": str(tmp_path), "interval": 0.01, "stop": stop},
+            daemon=True,
+        )
+        # When the loop runs briefly and is stopped
+        worker.start()
+        time.sleep(0.05)
+        stop.set()
+        worker.join(timeout=2)
+        # Then the loop survived the failures and exited
+        assert not worker.is_alive()
 
 
 # --------------------------------------------------------------------------
@@ -781,6 +1199,11 @@ def post(server: ThreadingHTTPServer, path: str) -> tuple[int, dict]:
 
 
 class TestHttpApi:
+    @pytest.fixture(autouse=True)
+    def obsidian_home(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Keep the persisted last-theme state inside the test sandbox
+        monkeypatch.setenv("OBSIDIAN_HOME", str(tmp_path))
+
     def test_set_theme_ok(self, server: ThreadingHTTPServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         # Given a vault available through the environment and a working CLI
         vault = tmp_path / "vault"

@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-09-06
-- Last updated: 2026-09-08
+- Last updated: 2026-09-09
 - Deciders: maintainers
 
 ## Context
@@ -89,6 +89,26 @@ detects the HA theme and posts it to the daemon through nginx.
    A failed reload is reported as `reloaded: false` but never fails the
    request: the file is already correct and the theme applies on the next
    app start.
+8. **Newly created vaults inherit the last requested theme.** On a
+   first-run install there is no vault, so the initial sync writes the
+   default location (`/config`); a vault the user later creates at another
+   path starts with Obsidian's default appearance and, if the HA theme never
+   changes again, stays out of sync forever. The daemon therefore persists
+   the last requested theme (allowlist-enforced, best-effort) at
+   `<home>/.config/ha-theme-sync.json` and runs a background watcher thread
+   that polls Obsidian's vault registry
+   (`<home>/.config/obsidian/obsidian.json`) every 2 s. A vault path that
+   appears in the registry after the watcher's first step gets the
+   remembered theme written (reusing `apply_theme`, so the same atomic
+   write, allowlist and ownership rules apply) and the app is reloaded once
+   if anything was written. The watcher's first step only records a
+   baseline — vault paths that already exist when it starts (including ones
+   created before a daemon restart) are never overwritten, so a
+   user-chosen custom theme is preserved. Polling is deliberate: Electron
+   rewrites the config by replacing the file, which would invalidate an
+   inotify watch. Rejected alternative: applying the theme to *all*
+   registered vaults on every request — that would clobber a custom theme
+   in an existing vault and still not fix the reported scenario.
 
 ## Consequences
 
@@ -109,6 +129,16 @@ detects the HA theme and posts it to the daemon through nginx.
   (the previous config stays intact thanks to the atomic replace).
 - The daemon spawns one short-lived subprocess (`obsidian-cli reload`) per
   actual theme change — never per request with an unchanged value.
+- The daemon also runs one long-lived background thread (the vault watcher)
+  that polls a small JSON file every 2 s — a negligible cost for the
+  add-on. A step that raises is swallowed, so the watcher can never crash
+  the daemon, and it only writes to vault paths registered after the
+  daemon's first observation, so it cannot clobber user settings in
+  existing vaults.
+- The remembered-theme state (`<home>/.config/ha-theme-sync.json`) is
+  best-effort: a write failure leaves the watcher with nothing to apply
+  until the next request, and it never fails the request itself, whose
+  theme write already succeeded.
 - `/api/set-theme` is reachable by anyone who can open the add-on web UI.
   It only accepts two whitelisted values and writes one key to the vault
   config, so the impact surface is negligible.

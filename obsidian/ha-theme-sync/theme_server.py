@@ -6,6 +6,11 @@ running app is asked to reload through its system CLI, so the change takes
 effect without restarting the add-on. The vault is resolved per request:
 explicit override, most recent vault recorded in Obsidian's global config,
 then the default vault location.
+
+A background watcher follows Obsidian's vault registry: a vault created after
+the last request starts with Obsidian's default appearance, so the last
+requested theme is applied to it and the app is reloaded — no browser request
+needed.
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
 from urllib.parse import parse_qs, urlparse
@@ -30,6 +36,10 @@ VAULT_ENV_VAR = "THEME_SYNC_VAULT"
 # latter is the app launcher, so a relative name would start a second app.
 DEFAULT_CLI_COMMAND = ("/opt/obsidian/obsidian-cli", "reload")
 DEFAULT_CLI_TIMEOUT = 15.0
+# The last requested theme, persisted so the vault watcher can apply it to
+# vaults created after the last request.
+LAST_THEME_STATE_FILE = "ha-theme-sync.json"
+DEFAULT_VAULT_WATCH_INTERVAL = 2.0
 
 _RGB_FN = re.compile(
     r"^rgba?\(\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*"
@@ -219,19 +229,24 @@ def handle_set_theme(
     theme: str | None,
     env: dict | None = None,
     reloder: Callable[..., object] | None = None,
+    obsidian_home: str | None = None,
 ) -> dict:
     """Apply a requested theme to the resolved vault and reload the app.
 
-    Returns {"changed": bool, "reloaded": bool}. Raises ValueError for a
-    missing or unknown theme, OSError on write failure. The reload is
-    best-effort: a failure is reported as reloaded=False, never raised.
+    Persists the requested theme so the vault watcher can bring newly created
+    vaults in sync. Returns {"changed": bool, "reloaded": bool}. Raises
+    ValueError for a missing or unknown theme, OSError on write failure. The
+    reload is best-effort: a failure is reported as reloaded=False, never
+    raised.
     """
     environment = dict(os.environ) if env is None else env
+    home = obsidian_home or environment.get("OBSIDIAN_HOME") or DEFAULT_OBSIDIAN_HOME
     if theme is None:
         raise ValueError("missing theme")
-    vault = resolve_vault(environment)
+    vault = resolve_vault(environment, obsidian_home=home)
     uid, gid = resolve_owner(environment)
     changed = apply_theme(vault, theme, uid, gid)
+    store_last_theme(theme, home)
     if not changed:
         return {"changed": False, "reloaded": False}
     reload = reloder if reloder is not None else reload_obsidian
@@ -240,6 +255,133 @@ def handle_set_theme(
     except Exception:  # noqa: BLE001 - reload is best-effort by contract
         reloaded = False
     return {"changed": True, "reloaded": reloaded}
+
+
+def store_last_theme(theme: str, home: str = DEFAULT_OBSIDIAN_HOME) -> None:
+    """Persist the last requested theme for the vault watcher (best-effort).
+
+    The theme is already applied when this runs, so a failure is swallowed:
+    the watcher simply has nothing to apply until the next request.
+    """
+    if theme not in VALID_THEMES:
+        return
+    path = os.path.join(home, ".config", LAST_THEME_STATE_FILE)
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"theme": theme}, handle)
+            handle.write("\n")
+    except OSError:
+        pass
+
+
+def load_last_theme(home: str = DEFAULT_OBSIDIAN_HOME) -> str | None:
+    """Read the persisted last requested theme; None when absent or invalid."""
+    try:
+        with open(os.path.join(home, ".config", LAST_THEME_STATE_FILE), encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    theme = data.get("theme") if isinstance(data, dict) else None
+    return theme if theme in VALID_THEMES else None
+
+
+def registered_vaults(config_data: object) -> set[str]:
+    """Existing vault paths recorded in Obsidian's global config."""
+    if not isinstance(config_data, dict):
+        return set()
+    vaults = config_data.get("vaults")
+    if not isinstance(vaults, dict):
+        return set()
+    paths: set[str] = set()
+    for entry in vaults.values():
+        if not isinstance(entry, dict):
+            continue
+        path = entry.get("path")
+        if isinstance(path, str) and os.path.isdir(path):
+            paths.add(path)
+    return paths
+
+
+def _load_global_config(home: str) -> object:
+    try:
+        with open(
+            os.path.join(home, ".config", "obsidian", "obsidian.json"), encoding="utf-8"
+        ) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+class VaultWatcher:
+    """Apply the remembered theme to vaults created after the last request.
+
+    Obsidian records every vault it opens in its global config. A new entry
+    means a vault that started with Obsidian's default appearance, so the
+    remembered theme is applied to it and the running app is reloaded. The
+    config is polled (a small JSON file) because Electron rewrites it by
+    replacing the file, which would invalidate an inotify watch on it.
+    """
+
+    def __init__(
+        self,
+        home: str = DEFAULT_OBSIDIAN_HOME,
+        env: dict | None = None,
+        reloder: Callable[..., object] | None = None,
+    ) -> None:
+        self.home = home
+        self.environment = dict(os.environ) if env is None else dict(env)
+        self.reloder = reloder if reloder is not None else reload_obsidian
+        self.seen_vaults: set[str] | None = None
+
+    def step(self) -> int:
+        """Synchronize vaults registered since the previous step.
+
+        The first step only records the current registry, so vaults that
+        existed before the watcher started are never overwritten. Returns
+        the number of vaults written.
+        """
+        current = registered_vaults(_load_global_config(self.home))
+        if self.seen_vaults is None:
+            self.seen_vaults = current
+            return 0
+        new_vaults = current - self.seen_vaults
+        self.seen_vaults = current
+        theme = load_last_theme(self.home)
+        if not new_vaults or theme is None:
+            return 0
+        uid, gid = resolve_owner(self.environment)
+        changed = 0
+        for vault in sorted(new_vaults):
+            try:
+                if apply_theme(vault, theme, uid, gid):
+                    changed += 1
+            except OSError:
+                continue
+        if changed:
+            try:
+                self.reloder(env=self.environment)
+            except Exception:  # noqa: BLE001 - reload is best-effort by contract
+                pass
+        return changed
+
+
+def run_vault_watcher(
+    home: str = DEFAULT_OBSIDIAN_HOME,
+    env: dict | None = None,
+    reloder: Callable[..., object] | None = None,
+    interval: float = DEFAULT_VAULT_WATCH_INTERVAL,
+    stop: threading.Event | None = None,
+) -> None:
+    """Poll the vault registry until stopped; every step is self-contained."""
+    watcher = VaultWatcher(home=home, env=env, reloder=reloder)
+    stop_event = stop if stop is not None else threading.Event()
+    while not stop_event.is_set():
+        try:
+            watcher.step()
+        except Exception:  # noqa: BLE001 - the watcher must survive any hiccup
+            pass
+        stop_event.wait(interval)
 
 
 class ThemeRequestHandler(BaseHTTPRequestHandler):
@@ -274,6 +416,14 @@ class ThemeRequestHandler(BaseHTTPRequestHandler):
 def main() -> None:
     host = os.environ.get("THEME_SYNC_HOST", DEFAULT_BIND_HOST)
     port = int(os.environ.get("THEME_SYNC_PORT", str(DEFAULT_BIND_PORT)))
+    home = os.environ.get("OBSIDIAN_HOME") or DEFAULT_OBSIDIAN_HOME
+    watcher = threading.Thread(
+        target=run_vault_watcher,
+        kwargs={"home": home},
+        name="ha-theme-sync-vaults",
+        daemon=True,
+    )
+    watcher.start()
     server = ThreadingHTTPServer((host, port), ThemeRequestHandler)
     print(f"[ha-theme-sync] listening on {host}:{port}", flush=True)
     server.serve_forever()
