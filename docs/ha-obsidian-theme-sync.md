@@ -94,7 +94,7 @@ Verified against the actual base image
    and best-effort `PUID`/`PGID` chown.
 8. **Always-200 API.** Invalid themes now return 400; unknown paths 404.
 9. **No tests, no ADR** (required by project policy). Both added:
-   `ha-theme-sync/test_theme_server.py` and
+   `tests/test_theme_server.py` and
    `obsidian/adr/0001-obsidian-ha-theme-sync.md`.
 10. **`FROM ...:latest`** would break the repo's digest pinning, Renovate and
     the auto-locker CI. The existing pinned base is kept and extended.
@@ -201,7 +201,7 @@ active vault, safely.
 - Runs as a stdlib-only script (`http.server.ThreadingHTTPServer`), with
   the watcher thread started from `main()`.
 
-**Verify.** `python3 -m pytest ha-theme-sync/ -v` — all green.
+**Verify.** `python3 -m pytest tests/ -v` — all green.
 
 ### Step 2 — Client detection (`ha-theme-sync/theme-sync.js`)
 
@@ -221,12 +221,12 @@ active vault, safely.
 - A failed send is retried a bounded number of times (3 attempts, 2 s
   apart, re-reading the current theme), so a transient error at the moment
   of a switch cannot lose the sync; 404 responses are not retried.
-- `ha-theme-sync/theme-sync.test.js` — 18 Given-When-Then tests under
+- `tests/theme-sync.test.js` — 18 Given-When-Then tests under
   `node --test` (zero dependencies) that load the real script into a fake
   browser: spec-faithful `MutationObserver` delivery, `matchMedia` change
   events, recorded `fetch`/timers.
 
-**Verify.** `node --test ha-theme-sync/theme-sync.test.js` all green;
+**Verify.** `node --test "tests/*.test.js"` all green;
 served file check (Step 5) + end-to-end smoke test (Section 6).
 
 ### Step 3 — s6 service (`root/etc/services.d/theme-api/run`)
@@ -281,19 +281,19 @@ both locations (Section 6).
 - `obsidian/adr/0001-obsidian-ha-theme-sync.md` records the decision, the
   rejected alternatives (runtime sed, `apk`, KasmVNC injection, string-based
   detection) and the consequences.
-- `ha-theme-sync/test_theme_server.py` — 120 Given-When-Then tests covering
+- `tests/test_theme_server.py` — 136 Given-When-Then tests covering
   parsing edge cases, threshold boundaries, vault resolution fall-throughs,
   atomicity, ownership, CLI reload success/failure paths, CLI enablement
   merges, API status codes and idempotency, the remembered-theme state
   (round-trip, allowlist, corruption, swallowed failures) and the vault
   watcher (baseline, new-vault sync, re-creation after removal, corrupt
   config, no-op registries, multi-vault reload coalescing, loop survival).
-- `ha-theme-sync/theme-sync.test.js` — the client's event-driven behavior
+- `tests/theme-sync.test.js` — the client's event-driven behavior
   (scheme change, parent mutations, guard, bounded retries, no polling)
   under `node --test` with a fake browser.
 
-**Verify.** `python3 -m pytest ha-theme-sync/ -v` all green;
-`node --test ha-theme-sync/theme-sync.test.js` all green; `shellcheck`
+**Verify.** `python3 -m pytest tests/ -v` all green;
+`node --test "tests/*.test.js"` all green; `shellcheck`
 on the run script.
 
 ---

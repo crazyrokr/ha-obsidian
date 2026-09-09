@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "obsidian" / "ha-theme-sync"))
 
 import theme_server as ts  # noqa: E402
 
@@ -1420,6 +1420,7 @@ class TestRunVaultWatcherEventDriven:
 
 ONESHOT_RUN = (
     Path(__file__).resolve().parent.parent
+    / "obsidian"
     / "root/etc/s6-overlay/s6-rc.d/init-obsidian-cli/run"
 )
 

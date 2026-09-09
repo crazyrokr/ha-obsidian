@@ -7,7 +7,7 @@
  * filtering), a matchMedia with change events, and recorded fetch /
  * setInterval / setTimeout calls. Run with:
  *
- *   node --test obsidian/ha-theme-sync/
+ *   node --test "tests/*.test.js"
  */
 
 const fs = require("node:fs");
@@ -15,7 +15,7 @@ const path = require("node:path");
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
 
-const SCRIPT_PATH = path.join(__dirname, "theme-sync.js");
+const SCRIPT_PATH = path.join(__dirname, "..", "obsidian", "ha-theme-sync", "theme-sync.js");
 const ENDPOINT = "https://ha.example.com/api/ingress/t0k3n/api/set-theme";
 
 const THEME_VARS = {
