@@ -179,14 +179,25 @@ active vault, safely.
   - `registered_vaults()` — the existing vault paths recorded in Obsidian's
     global config; non-dict configs, non-dict entries and non-existent
     paths are skipped.
-  - `VaultWatcher` / `run_vault_watcher()` — a daemon thread polling the
-    vault registry every 2 s. The first step only records a baseline, so
-    vaults that existed before the watcher started are never overwritten;
-    a newly registered vault gets the remembered theme written (allowlist
-    enforced by `apply_theme`) and, only when something was written, a
-    best-effort `obsidian-cli reload`. A step that raises never stops the
-    loop; polling (not inotify) survives Electron's replace-the-file config
-    rewrites.
+  - `InotifyWaiter` / `create_config_waiter()` — an inotify(7) waiter on
+    the config directory, built with `ctypes` (no dependencies). `wait()`
+    blocks in the kernel until a create/delete/modify/move event arrives,
+    drains it, and returns a boolean; a dead watch (`IN_DELETE_SELF` /
+    `IN_IGNORED`) is reported through `is_alive`. Watching the directory —
+    not the file — survives Electron's replace-the-file config rewrites
+    (new inode → `IN_CREATE`/`IN_MOVED_TO`; in-place write → `IN_MODIFY`).
+  - `VaultWatcher` / `run_vault_watcher()` — a daemon thread that keeps the
+    vault registry in sync. On Linux it is event-driven: it blocks in
+    inotify until the config directory changes, so an idle watcher costs
+    no CPU and reacts within one syscall of the write; a safety rescan
+    every 60 s guards against lost events. Without inotify, or before the
+    config directory exists (first boot), it polls every 2 s and retries
+    the inotify watch each cycle. The first step only records a baseline,
+    so vaults that existed before the watcher started are never
+    overwritten; a newly registered vault gets the remembered theme written
+    (allowlist enforced by `apply_theme`) and, only when something was
+    written, a best-effort `obsidian-cli reload`. A step that raises never
+    stops the loop.
 - Runs as a stdlib-only script (`http.server.ThreadingHTTPServer`), with
   the watcher thread started from `main()`.
 
@@ -321,7 +332,9 @@ on the run script.
      `s6-setuidgid abc /opt/obsidian/obsidian-cli help` to see the CLI error text.
    - *A newly created vault stays at the default theme* → the daemon
      watcher applies the remembered theme to vaults registered after the
-     last request, within about 2 s. Check that
+     last request — immediately on Linux (inotify event on the config
+     directory), or within a couple of seconds on the polling fallback.
+     Check that
      `/config/.config/ha-theme-sync.json` exists (it is only written after
      the first `/api/set-theme` request — until then there is nothing to
      apply), that the vault is listed in

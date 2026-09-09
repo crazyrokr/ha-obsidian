@@ -10,18 +10,24 @@ then the default vault location.
 A background watcher follows Obsidian's vault registry: a vault created after
 the last request starts with Obsidian's default appearance, so the last
 requested theme is applied to it and the app is reloaded — no browser request
-needed.
+needed. The watcher is event-driven on Linux (inotify on the config
+directory, idle cost zero) and degrades to a few seconds of polling only
+where inotify is unavailable.
 """
 
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import json
 import os
 import re
+import select
+import struct
 import subprocess
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
 from urllib.parse import parse_qs, urlparse
@@ -40,6 +46,23 @@ DEFAULT_CLI_TIMEOUT = 15.0
 # vaults created after the last request.
 LAST_THEME_STATE_FILE = "ha-theme-sync.json"
 DEFAULT_VAULT_WATCH_INTERVAL = 2.0
+# Event mode slices the inotify wait so a stop request is honored within this
+# bound; the sweep rescan guards against events that were never delivered.
+DEFAULT_WAKE_TIMEOUT = 1.0
+DEFAULT_SWEEP_INTERVAL = 60.0
+
+# inotify(7) event masks: the config file appears, is rewritten in place, or
+# is swapped for a new inode. Obsidian (Electron) can do either — a temp file
+# plus rename, or a plain in-place write — and the swap would kill a watch on
+# the file itself, so we watch the directory, which survives and reports both
+# cases.
+IN_CREATE = 0x00000100
+IN_DELETE = 0x00000200
+IN_MODIFY = 0x00000002
+IN_MOVED_FROM = 0x00000040
+IN_MOVED_TO = 0x00000080
+IN_DELETE_SELF = 0x00000400
+IN_IGNORED = 0x00008000
 
 _RGB_FN = re.compile(
     r"^rgba?\(\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*"
@@ -319,8 +342,9 @@ class VaultWatcher:
     Obsidian records every vault it opens in its global config. A new entry
     means a vault that started with Obsidian's default appearance, so the
     remembered theme is applied to it and the running app is reloaded. The
-    config is polled (a small JSON file) because Electron rewrites it by
-    replacing the file, which would invalidate an inotify watch on it.
+    registry is re-read on every step; when to step is decided by
+    run_vault_watcher (an inotify event on the config directory, with
+    polling as the fallback).
     """
 
     def __init__(
@@ -366,22 +390,148 @@ class VaultWatcher:
         return changed
 
 
+class InotifyWaiter:
+    """Wait for changes inside a directory with inotify(7); no CPU while idle.
+
+    wait() blocks in a kernel select/read, so an idle watcher costs nothing.
+    A delivered event is drained and never re-fires. When the watched
+    directory itself is removed (IN_DELETE_SELF), is_alive turns False and
+    the caller must fall back to polling or recreate the waiter.
+    """
+
+    def __init__(self, directory: str) -> None:
+        libc = self._load_libc()
+        libc.inotify_init1.restype = ctypes.c_int
+        libc.inotify_add_watch.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        fd = libc.inotify_init1(0)
+        if fd < 0:
+            raise OSError(ctypes.get_errno(), "inotify_init1 failed")
+        try:
+            ctypes.set_errno(0)
+            mask = IN_CREATE | IN_DELETE | IN_MODIFY | IN_MOVED_FROM | IN_MOVED_TO
+            watch = libc.inotify_add_watch(fd, os.fsencode(directory), mask)
+        except BaseException:
+            os.close(fd)
+            raise
+        if watch < 0:
+            os.close(fd)
+            raise OSError(ctypes.get_errno(), "inotify_add_watch failed")
+        self._fd = fd
+        self._alive = True
+
+    @staticmethod
+    def _load_libc() -> "ctypes.CDLL":
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.inotify_init1
+            libc.inotify_add_watch
+            return libc
+        except (AttributeError, OSError):
+            raise OSError("inotify is not available on this platform") from None
+
+    @property
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def wait(self, timeout: float) -> bool:
+        """Block until a change event arrives; True on event, False on timeout.
+
+        Raises nothing: a broken watch marks the waiter dead and returns
+        False, so the caller always sees a boolean and a consistent
+        is_alive.
+        """
+        if not self._alive:
+            return False
+        try:
+            ready, _, _ = select.select([self._fd], [], [], timeout)
+            if not ready:
+                return False
+            data = os.read(self._fd, 65536)
+        except OSError:
+            self._alive = False
+            return False
+        if not data:
+            self._alive = False
+            return False
+        offset = 0
+        while offset + 16 <= len(data):
+            # inotify_event: int32 wd, uint32 mask, uint32 cookie, uint32 len
+            mask = struct.unpack_from("<I", data, offset + 4)[0]
+            length = struct.unpack_from("<I", data, offset + 12)[0]
+            # Either flag means the watched directory is gone: mark the
+            # waiter dead so the caller falls back or recreates it.
+            if mask & (IN_DELETE_SELF | IN_IGNORED):
+                self._alive = False
+            offset += 16 + length
+        return True
+
+
+def create_config_waiter(home: str) -> InotifyWaiter | None:
+    """Event waiter for the directory holding Obsidian's global config.
+
+    Returns None when inotify is unavailable or the directory does not exist
+    yet. The watcher loop polls in that case and retries on every cycle, so a
+    config directory that appears later is picked up without a restart.
+    """
+    try:
+        return InotifyWaiter(os.path.join(home, ".config", "obsidian"))
+    except OSError:
+        return None
+
+
 def run_vault_watcher(
     home: str = DEFAULT_OBSIDIAN_HOME,
     env: dict | None = None,
     reloder: Callable[..., object] | None = None,
     interval: float = DEFAULT_VAULT_WATCH_INTERVAL,
     stop: threading.Event | None = None,
+    sweep: float = DEFAULT_SWEEP_INTERVAL,
+    waiter: InotifyWaiter | None = None,
 ) -> None:
-    """Poll the vault registry until stopped; every step is self-contained."""
+    """Synchronize vaults registered since the previous step, idly for free.
+
+    On Linux the loop blocks in inotify until Obsidian's config directory
+    changes, so an idle watcher costs no CPU and reacts within one syscall of
+    the write. A sweep rescan every `sweep` seconds guards against events
+    that were never delivered. Without inotify (or before the config
+    directory exists) the loop polls every `interval` seconds instead.
+    """
     watcher = VaultWatcher(home=home, env=env, reloder=reloder)
-    stop_event = stop if stop is not None else threading.Event()
-    while not stop_event.is_set():
+
+    def step() -> None:
         try:
             watcher.step()
         except Exception:  # noqa: BLE001 - the watcher must survive any hiccup
             pass
-        stop_event.wait(interval)
+
+    stop_event = stop if stop is not None else threading.Event()
+    # Baseline: the first step records the existing registry, so later steps
+    # can tell new vaults apart from pre-existing ones.
+    step()
+    last_step = time.monotonic()
+    while not stop_event.is_set():
+        if waiter is None or not waiter.is_alive:
+            # No live channel: scan once to cover the time the channel was
+            # blind, then re-establish it before trusting events again.
+            step()
+            last_step = time.monotonic()
+            waiter = create_config_waiter(home)
+            if waiter is not None and waiter.is_alive:
+                continue  # baseline covered; from here on, trust events
+            stop_event.wait(interval)  # still no channel: poll next cycle
+            continue
+        now = time.monotonic()
+        if now - last_step >= sweep:
+            # Safety rescan in case an event was never delivered.
+            step()
+            last_step = time.monotonic()
+            continue
+        if not waiter.wait(min(DEFAULT_WAKE_TIMEOUT, sweep - (now - last_step))):
+            continue  # timed out: loop top re-checks the sweep deadline
+        # a config change arrived
+        step()
+        last_step = time.monotonic()
 
 
 class ThemeRequestHandler(BaseHTTPRequestHandler):

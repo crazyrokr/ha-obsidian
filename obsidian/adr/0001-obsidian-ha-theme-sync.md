@@ -96,19 +96,31 @@ detects the HA theme and posts it to the daemon through nginx.
    changes again, stays out of sync forever. The daemon therefore persists
    the last requested theme (allowlist-enforced, best-effort) at
    `<home>/.config/ha-theme-sync.json` and runs a background watcher thread
-   that polls Obsidian's vault registry
-   (`<home>/.config/obsidian/obsidian.json`) every 2 s. A vault path that
-   appears in the registry after the watcher's first step gets the
+   for Obsidian's vault registry
+   (`<home>/.config/obsidian/obsidian.json`). The watcher is event-driven
+   on Linux: it watches the config *directory* with inotify (through
+   `ctypes`, so the zero-dependency constraint holds) and blocks in the
+   kernel until a create/delete/modify/move event arrives, so an idle
+   watcher costs no CPU and reacts within one syscall of Obsidian's write.
+   Watching the directory — rather than the file — is what makes inotify
+   viable here: Electron rewrites the config either by replacing it with a
+   new inode (temp file plus rename, surfacing as `IN_CREATE`/`IN_MOVED_TO`)
+   or in place (`IN_MODIFY`), and a watch on the file would die on the
+   former. A safety rescan every 60 s covers events that were never
+   delivered, and when inotify is unavailable — or the directory does not
+   exist yet (first boot, before Obsidian has run) — the watcher degrades to
+   polling every 2 s and retries the inotify watch each cycle, so a config
+   directory that appears later is picked up without a restart. A vault path
+   that appears in the registry after the watcher's first step gets the
    remembered theme written (reusing `apply_theme`, so the same atomic
    write, allowlist and ownership rules apply) and the app is reloaded once
    if anything was written. The watcher's first step only records a
    baseline — vault paths that already exist when it starts (including ones
    created before a daemon restart) are never overwritten, so a
-   user-chosen custom theme is preserved. Polling is deliberate: Electron
-   rewrites the config by replacing the file, which would invalidate an
-   inotify watch. Rejected alternative: applying the theme to *all*
-   registered vaults on every request — that would clobber a custom theme
-   in an existing vault and still not fix the reported scenario.
+   user-chosen custom theme is preserved. Rejected alternative: applying
+   the theme to *all* registered vaults on every request — that would
+   clobber a custom theme in an existing vault and still not fix the
+   reported scenario.
 
 ## Consequences
 
@@ -129,12 +141,14 @@ detects the HA theme and posts it to the daemon through nginx.
   (the previous config stays intact thanks to the atomic replace).
 - The daemon spawns one short-lived subprocess (`obsidian-cli reload`) per
   actual theme change — never per request with an unchanged value.
-- The daemon also runs one long-lived background thread (the vault watcher)
-  that polls a small JSON file every 2 s — a negligible cost for the
-  add-on. A step that raises is swallowed, so the watcher can never crash
-  the daemon, and it only writes to vault paths registered after the
-  daemon's first observation, so it cannot clobber user settings in
-  existing vaults.
+- The daemon also runs one long-lived background thread (the vault
+  watcher). In event mode it blocks in a kernel inotify wait, so an idle
+  watcher costs no CPU; it wakes to rescan a small JSON file on each config
+  change, plus a safety rescan every 60 s. Without inotify it polls the
+  file every 2 s instead. A step that raises is swallowed, so the watcher
+  can never crash the daemon, and it only writes to vault paths registered
+  after the daemon's first observation, so it cannot clobber user settings
+  in existing vaults.
 - The remembered-theme state (`<home>/.config/ha-theme-sync.json`) is
   best-effort: a write failure leaves the watcher with nothing to apply
   until the next request, and it never fails the request itself, whose

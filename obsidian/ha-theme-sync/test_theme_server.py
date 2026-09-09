@@ -10,6 +10,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -1064,6 +1066,351 @@ class TestRunVaultWatcher:
         stop.set()
         worker.join(timeout=2)
         # Then the loop survived the failures and exited
+        assert not worker.is_alive()
+
+
+# --------------------------------------------------------------------------
+# InotifyWaiter (event-driven config change detection)
+# --------------------------------------------------------------------------
+
+INOTIFY = pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="inotify is Linux-only"
+)
+
+
+def counting_watcher(monkeypatch: pytest.MonkeyPatch, steps: list[int]) -> None:
+    """Replace ts.VaultWatcher with a stub that records each step."""
+
+    class CountingWatcher:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def step(self) -> int:
+            steps.append(1)
+            return 0
+
+    monkeypatch.setattr(ts, "VaultWatcher", CountingWatcher)
+
+
+def wait_until(predicate, timeout: float = 5.0) -> bool:
+    """Poll a predicate until it holds or the deadline passes."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return predicate()
+
+
+@INOTIFY
+class TestInotifyWaiter:
+    def test_wait_blocks_until_timeout_without_changes(self, tmp_path: Path) -> None:
+        # Given a watched directory that stays untouched
+        watched = tmp_path / "config"
+        watched.mkdir()
+        waiter = ts.InotifyWaiter(str(watched))
+        # When waiting without any change
+        start = time.monotonic()
+        woke = waiter.wait(0.3)
+        # Then it blocks until the timeout and reports no event
+        assert woke is False
+        assert time.monotonic() - start >= 0.25
+
+    def test_wakes_on_file_creation(self, tmp_path: Path) -> None:
+        # Given a watched directory
+        watched = tmp_path / "config"
+        watched.mkdir()
+        waiter = ts.InotifyWaiter(str(watched))
+        # When a config file appears
+        (watched / "obsidian.json").write_text("{}", encoding="utf-8")
+        # Then the wait reports the event
+        assert waiter.wait(1.0) is True
+
+    def test_wakes_on_atomic_replacement(self, tmp_path: Path) -> None:
+        # Given a watched directory holding a config file (Electron's write
+        # pattern replaces the file with a new inode rather than editing it)
+        watched = tmp_path / "config"
+        watched.mkdir()
+        current = watched / "obsidian.json"
+        current.write_text("{}", encoding="utf-8")
+        waiter = ts.InotifyWaiter(str(watched))
+        replacement = watched / ".obsidian.json.tmp"
+        replacement.write_text('{"vaults": {}}', encoding="utf-8")
+        # When the file is replaced atomically
+        os.replace(str(replacement), str(current))
+        # Then the wait reports the event
+        assert waiter.wait(1.0) is True
+
+    def test_wakes_on_file_deletion(self, tmp_path: Path) -> None:
+        # Given a watched directory holding a config file
+        watched = tmp_path / "config"
+        watched.mkdir()
+        current = watched / "obsidian.json"
+        current.write_text("{}", encoding="utf-8")
+        waiter = ts.InotifyWaiter(str(watched))
+        # When the file is removed
+        current.unlink()
+        # Then the wait reports the event
+        assert waiter.wait(1.0) is True
+
+    def test_no_phantom_event_after_drain(self, tmp_path: Path) -> None:
+        # Given a live waiter and a consumed change event
+        watched = tmp_path / "config"
+        watched.mkdir()
+        waiter = ts.InotifyWaiter(str(watched))
+        (watched / "obsidian.json").write_text("{}", encoding="utf-8")
+        assert waiter.wait(1.0) is True
+        # When waiting again with nothing new
+        # Then the already-delivered event does not re-fire (no busy loop)
+        assert waiter.wait(0.3) is False
+
+    def test_dies_when_watched_directory_is_removed(self, tmp_path: Path) -> None:
+        # Given a live waiter
+        watched = tmp_path / "config"
+        watched.mkdir()
+        waiter = ts.InotifyWaiter(str(watched))
+        # When the directory itself disappears
+        watched.rmdir()
+        # Then the self-removal is delivered and the waiter is unusable
+        assert waiter.wait(1.0) is True
+        assert waiter.is_alive is False
+        assert waiter.wait(0.1) is False
+
+    def test_missing_directory_is_rejected(self, tmp_path: Path) -> None:
+        # Given a path that does not exist
+        # When constructing a waiter for it
+        with pytest.raises(OSError):
+            ts.InotifyWaiter(str(tmp_path / "absent"))
+
+
+class TestCreateConfigWaiter:
+    def test_waits_on_the_directory_holding_the_config(self, tmp_path: Path) -> None:
+        # Given a home with the global config in place
+        write_global_config(tmp_path, {"vaults": {}})
+        # When the factory builds the waiter
+        waiter = ts.create_config_waiter(str(tmp_path))
+        # Then on Linux it is a live inotify waiter
+        if sys.platform.startswith("linux"):
+            assert isinstance(waiter, ts.InotifyWaiter)
+            assert waiter.is_alive is True
+        else:
+            assert waiter is None
+
+    def test_without_config_directory_returns_none(self, tmp_path: Path) -> None:
+        # Given a home without the config directory (first boot, pre-Obsidian)
+        # When the factory builds the waiter
+        # Then it yields None so the loop falls back to polling
+        assert ts.create_config_waiter(str(tmp_path)) is None
+
+
+@INOTIFY
+class TestRunVaultWatcherEventDriven:
+    def test_applies_theme_asap_when_registry_changes(self, tmp_path: Path) -> None:
+        # Given a remembered theme, an empty registry, and a live event waiter
+        ts.store_last_theme("moonstone", str(tmp_path))
+        config_dir = tmp_path / ".config" / "obsidian"
+        config_dir.mkdir(parents=True)
+        waiter = ts.InotifyWaiter(str(config_dir))
+        stop = threading.Event()
+        worker = threading.Thread(
+            target=ts.run_vault_watcher,
+            kwargs={
+                "home": str(tmp_path),
+                "interval": 30.0,  # polling would take 30 s; events must not
+                "stop": stop,
+                "waiter": waiter,
+            },
+            daemon=True,
+        )
+        # When the user creates a vault (Obsidian writes the registry)
+        worker.start()
+        time.sleep(0.3)  # let the loop record the baseline first
+        vault = tmp_path / "new-vault"
+        vault.mkdir()
+        register_vault(tmp_path, vault)
+        applied = wait_until(lambda: appearance(vault).exists())
+        stop.set()
+        worker.join(timeout=5)
+        # Then the theme is applied well before the polling deadline
+        assert not worker.is_alive()
+        assert applied
+        assert (
+            json.loads(appearance(vault).read_text(encoding="utf-8"))["theme"]
+            == "moonstone"
+        )
+
+    def test_applies_theme_when_registry_is_rewritten_in_place(self, tmp_path: Path) -> None:
+        # Given a live event waiter and an empty registry
+        ts.store_last_theme("moonstone", str(tmp_path))
+        config_dir = tmp_path / ".config" / "obsidian"
+        config_dir.mkdir(parents=True)
+        waiter = ts.InotifyWaiter(str(config_dir))
+        stop = threading.Event()
+        worker = threading.Thread(
+            target=ts.run_vault_watcher,
+            kwargs={
+                "home": str(tmp_path),
+                "interval": 30.0,  # polling would take 30 s; events must not
+                "stop": stop,
+                "waiter": waiter,
+            },
+            daemon=True,
+        )
+        worker.start()
+        time.sleep(0.3)  # let the loop record the baseline first
+        # When Obsidian registers a vault, then rewrites the same file in
+        # place (fs.writeFileSync, no new inode) to register another
+        first = tmp_path / "first-vault"
+        first.mkdir()
+        register_vault(tmp_path, first, index="one")
+        applied_first = wait_until(lambda: appearance(first).exists())
+        second = tmp_path / "second-vault"
+        second.mkdir()
+        write_global_config(
+            tmp_path,
+            {
+                "vaults": {
+                    "one": {"path": str(first), "ts": 1},
+                    "two": {"path": str(second), "ts": 2},
+                }
+            },
+        )
+        applied_second = wait_until(lambda: appearance(second).exists())
+        stop.set()
+        worker.join(timeout=5)
+        # Then both writes were picked up by events, not polling
+        assert not worker.is_alive()
+        assert applied_first
+        assert applied_second
+
+    def test_idle_loop_does_not_spin(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Given a counting watcher, a live event waiter, and no config changes
+        steps: list[int] = []
+        counting_watcher(monkeypatch, steps)
+        config_dir = tmp_path / ".config" / "obsidian"
+        config_dir.mkdir(parents=True)
+        waiter = ts.InotifyWaiter(str(config_dir))
+        stop = threading.Event()
+        worker = threading.Thread(
+            target=ts.run_vault_watcher,
+            kwargs={
+                "home": str(tmp_path),
+                "interval": 0.01,  # a polling loop would step ~50 times
+                "stop": stop,
+                "waiter": waiter,
+            },
+            daemon=True,
+        )
+        # When the loop runs idle for a while
+        worker.start()
+        time.sleep(0.6)
+        stop.set()
+        worker.join(timeout=5)
+        # Then it stepped only for the initial baseline, not on a timer
+        assert not worker.is_alive()
+        assert len(steps) <= 2
+
+    def test_falls_back_to_polling_when_inotify_unavailable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Given a platform where the factory yields no waiter
+        steps: list[int] = []
+        counting_watcher(monkeypatch, steps)
+        monkeypatch.setattr(ts, "create_config_waiter", lambda home: None)
+        stop = threading.Event()
+        worker = threading.Thread(
+            target=ts.run_vault_watcher,
+            kwargs={"home": str(tmp_path), "interval": 0.01, "stop": stop},
+            daemon=True,
+        )
+        # When the loop runs briefly
+        worker.start()
+        time.sleep(0.3)
+        stop.set()
+        worker.join(timeout=5)
+        # Then it keeps stepping on the polling cadence and exits cleanly
+        assert not worker.is_alive()
+        assert len(steps) >= 3
+
+    def test_recovers_to_polling_when_the_waiter_dies(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Given an injected waiter that is already dead (dir deleted, watch gone)
+        steps: list[int] = []
+        counting_watcher(monkeypatch, steps)
+        monkeypatch.setattr(ts, "create_config_waiter", lambda home: None)
+
+        class DeadWaiter:
+            is_alive = False
+
+            def wait(self, timeout: float) -> bool:
+                return False
+
+        stop = threading.Event()
+        worker = threading.Thread(
+            target=ts.run_vault_watcher,
+            kwargs={
+                "home": str(tmp_path),
+                "interval": 0.01,
+                "stop": stop,
+                "waiter": DeadWaiter(),
+            },
+            daemon=True,
+        )
+        # When the loop runs briefly
+        worker.start()
+        time.sleep(0.3)
+        stop.set()
+        worker.join(timeout=5)
+        # Then polling takes over and the loop exits cleanly
+        assert not worker.is_alive()
+        assert len(steps) >= 3
+
+    def test_directory_created_later_is_synced(self, tmp_path: Path) -> None:
+        # Given a home without the config directory (first boot) and a
+        # remembered theme
+        ts.store_last_theme("moonstone", str(tmp_path))
+        stop = threading.Event()
+        worker = threading.Thread(
+            target=ts.run_vault_watcher,
+            kwargs={"home": str(tmp_path), "interval": 0.05, "stop": stop},
+            daemon=True,
+        )
+        # When Obsidian later creates the config and registers a vault
+        worker.start()
+        time.sleep(0.2)
+        vault = tmp_path / "late-vault"
+        vault.mkdir()
+        register_vault(tmp_path, vault)
+        applied = wait_until(lambda: appearance(vault).exists())
+        stop.set()
+        worker.join(timeout=5)
+        # Then the late-registered vault still receives the theme
+        assert not worker.is_alive()
+        assert applied
+
+    def test_stop_is_honored_during_event_wait(self, tmp_path: Path) -> None:
+        # Given a live event waiter with no events arriving
+        config_dir = tmp_path / ".config" / "obsidian"
+        config_dir.mkdir(parents=True)
+        waiter = ts.InotifyWaiter(str(config_dir))
+        stop = threading.Event()
+        worker = threading.Thread(
+            target=ts.run_vault_watcher,
+            kwargs={
+                "home": str(tmp_path),
+                "interval": 30.0,
+                "stop": stop,
+                "waiter": waiter,
+            },
+            daemon=True,
+        )
+        # When the loop is stopped while blocked in the event wait
+        worker.start()
+        time.sleep(0.1)
+        stop.set()
+        worker.join(timeout=3)
+        # Then it exits promptly (the wait is sliced, not unbounded)
         assert not worker.is_alive()
 
 
