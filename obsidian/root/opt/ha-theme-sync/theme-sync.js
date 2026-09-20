@@ -1,7 +1,11 @@
-/* Synchronizes the in-container Obsidian theme with the active Home Assistant
- * theme. Runs in the add-on web UI: when embedded via HA ingress the parent
- * window is same-origin and HA's theme variables are readable; otherwise the
- * browser color scheme is used as the fallback.
+/* Synchronizes the in-container Obsidian theme — and the desktop background
+ * behind it — with the active Home Assistant theme. Runs in the add-on web
+ * UI: when embedded via HA ingress the parent window is same-origin and HA's
+ * theme variables are readable; otherwise the browser color scheme is used
+ * as the fallback.
+ *
+ * The theme is always posted; the exact HA background color is posted along
+ * with it when readable, so the desktop can mirror it instead of guessing.
  *
  * Re-syncs are event-driven, not polled. The prefers-color-scheme change
  * event covers the fallback, and a MutationObserver on the parent document
@@ -47,6 +51,38 @@
     return luminance < 0.5;
   }
 
+  function toHex(rgb) {
+    var channels = rgb.map(function (channel) {
+      var clamped = Math.max(0, Math.min(255, Math.round(channel)));
+      return ("0" + clamped.toString(16)).slice(-2);
+    });
+    return "#" + channels.join("");
+  }
+
+  /* The exact HA background color, read from the same variables the theme
+   * decision uses (first parseable candidate wins), normalized to opaque
+   * #rrggbb. null when the parent is not accessible or carries no parseable
+   * color — the daemon then falls back to its per-theme default.
+   */
+  function parentBackground() {
+    try {
+      var parentWindow = window.parent;
+      if (!parentWindow || parentWindow === window) return null;
+      var styles = parentWindow.getComputedStyle(parentWindow.document.documentElement);
+      var candidates = [
+        styles.getPropertyValue("--clear-background-color"),
+        styles.getPropertyValue("--primary-background-color")
+      ];
+      for (var i = 0; i < candidates.length; i += 1) {
+        var rgb = parseColor(candidates[i]);
+        if (rgb) return toHex(rgb);
+      }
+      return null;
+    } catch (error) {
+      return null;
+    }
+  }
+
   function parentTheme() {
     try {
       var parentWindow = window.parent;
@@ -73,8 +109,12 @@
     return "moonstone";
   }
 
+  /* {theme, color}: the color is null on the fallback path (standalone tab,
+   * cross-origin or colorless parent), where the daemon applies its
+   * per-theme default instead.
+   */
   function currentTheme() {
-    return parentTheme() || localTheme();
+    return { theme: parentTheme() || localTheme(), color: parentBackground() };
   }
 
   /* The page is served under the ingress path (/api/ingress/<token>) when
@@ -98,11 +138,23 @@
     attemptDelivery();
   }
 
+  /* The guard key covers theme AND color: a background-color change with an
+   * unchanged theme (a custom HA theme in the same luminance class) must
+   * still be delivered.
+   */
+  function deliveryKey(state) {
+    return state.theme + "|" + (state.color || "");
+  }
+
   function attemptDelivery() {
-    var theme = currentTheme();
-    if (theme === lastSent) return;
-    lastSent = theme;
-    fetch(endpoint + "?theme=" + encodeURIComponent(theme), { method: "POST" })
+    var state = currentTheme();
+    if (deliveryKey(state) === lastSent) return;
+    lastSent = deliveryKey(state);
+    var query = "theme=" + encodeURIComponent(state.theme);
+    if (state.color) {
+      query += "&color=" + encodeURIComponent(state.color);
+    }
+    fetch(endpoint + "?" + query, { method: "POST" })
       .then(function (response) {
         if (response.ok) {
           consecutiveFailures = 0;

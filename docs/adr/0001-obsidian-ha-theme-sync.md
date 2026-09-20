@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-09-06
-- Last updated: 2026-09-09
+- Last updated: 2026-09-20
 - Deciders: maintainers
 
 ## Context
@@ -121,6 +121,35 @@ detects the HA theme and posts it to the daemon through nginx.
    the theme to *all* registered vaults on every request — that would
    clobber a custom theme in an existing vault and still not fix the
    reported scenario.
+9. **The desktop background follows the theme.** The black background
+   behind the streamed desktop is painted in the theme's color. The client
+   already reads the HA background variables, so it also posts the exact
+   color (`&color=<#rrggbb>`, the same first parseable candidate the theme
+   decision uses) — the desktop mirrors the real HA background rather than
+   a guess. The daemon validates the color's darkness against the theme
+   (a light color for the dark theme is a contract violation, rejected
+   with 400 — the desktop must never go light under a dark theme), falls
+   back to a per-theme default (`#000000` dark, `#f2f4f9` light) when the
+   color is missing, remembers the last color in the existing state file,
+   and restores it at boot. The base image ships two desktop stacks,
+   selected by `PIXELFLUX_WAYLAND`, and both are supported: in X mode
+   (the shipped configuration) `xsetroot -solid` paints Xvfb's root window
+   and is re-applied on a 30 s cadence; in Wayland mode a `swaybg` process
+   runs as a client of the *nested* labwc compositor and is respawned
+   whenever it dies. Nested-display discovery is done through the
+   `wayland-<n>.lock` files: every Wayland server keeps its lock open, so
+   the lock's inode names its owner — and only a labwc-owned display
+   renders a background client (Selkies owns the streamed root display,
+   where a background would be hidden behind the nested window). A
+   supervisor thread re-establishes the background until the desktop is up
+   and afterwards whenever it is missing, so the color survives desktop
+   restarts. All background failures are swallowed: the background is a
+   cosmetic concern and must never break a theme request. `swaybg` is
+   installed into the image; `xsetroot` already ships with the base image
+   via `x11-xserver-utils`. Rejected alternative: a fixed per-theme
+   background without the exact color — the color is already read
+   client-side, so posting it costs nothing and matches the requested
+   behavior.
 
 ## Consequences
 
@@ -149,6 +178,17 @@ detects the HA theme and posts it to the daemon through nginx.
   can never crash the daemon, and it only writes to vault paths registered
   after the daemon's first observation, so it cannot clobber user settings
   in existing vaults.
+- The daemon runs a second long-lived background thread that keeps the
+  desktop background in the requested color. It wakes every 2 s; in X mode
+  the work is a `xsetroot -solid` re-apply every 30 s, in Wayland mode a
+  cheap `poll()` of the `swaybg` client plus a `/proc` comm scan when the
+  desktop comes up. An idle supervisor is near-free, and a failing step is
+  swallowed, so it can never crash the daemon or fail a theme request.
+- The state file may now carry a `background` key; older state files
+  without it are read as theme-only, and the daemon falls back to the
+  per-theme default until a request carries a color again.
+- The image carries one extra package (`swaybg`); the X-mode painting uses
+  `xsetroot`, already present via `x11-xserver-utils`.
 - The remembered-theme state (`<home>/.config/ha-theme-sync.json`) is
   best-effort: a write failure leaves the watcher with nothing to apply
   until the next request, and it never fails the request itself, whose

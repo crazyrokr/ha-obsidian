@@ -277,22 +277,23 @@ function createBrowser(options = {}) {
 
 // ------------------------------------------------------------------ tests
 
-test("embedded dark parent: posts obsidian once on load", () => {
+test("embedded dark parent: posts obsidian and its background once on load", () => {
   // Given the add-on UI is embedded in a dark-themed HA window
   const browser = createBrowser({ parentTheme: "dark" });
   // When the page loads
   browser.load();
-  // Then exactly one POST reaches the ingress-derived endpoint
-  assert.deepEqual(browser.posts, [ENDPOINT + "?theme=obsidian"]);
+  // Then exactly one POST reaches the ingress-derived endpoint,
+  // carrying the exact HA background color
+  assert.deepEqual(browser.posts, [ENDPOINT + "?theme=obsidian&color=%230b0c10"]);
 });
 
-test("embedded light parent: posts moonstone on load", () => {
+test("embedded light parent: posts moonstone and its background on load", () => {
   // Given the add-on UI is embedded in a light-themed HA window
   const browser = createBrowser({ parentTheme: "light" });
   // When the page loads
   browser.load();
-  // Then the light theme is requested
-  assert.deepEqual(browser.posts, [ENDPOINT + "?theme=moonstone"]);
+  // Then the light theme and its exact background are requested
+  assert.deepEqual(browser.posts, [ENDPOINT + "?theme=moonstone&color=%23ffffff"]);
 });
 
 test("standalone dark scheme: falls back to prefers-color-scheme", () => {
@@ -371,10 +372,10 @@ test("HA theme switch: re-syncs on the parent theme attribute mutation", async (
   // When HA switches to a light theme (attribute change on <html>)
   browser.setParentTheme("light");
   await browser.tick();
-  // Then the client requests the light theme
+  // Then the client requests the light theme with its background
   assert.deepEqual(browser.posts, [
-    ENDPOINT + "?theme=obsidian",
-    ENDPOINT + "?theme=moonstone",
+    ENDPOINT + "?theme=obsidian&color=%230b0c10",
+    ENDPOINT + "?theme=moonstone&color=%23ffffff",
   ]);
 });
 
@@ -385,10 +386,38 @@ test("HA inline custom property: re-syncs on the root style mutation", async () 
   // When HA overrides the background variable inline on :root
   browser.setStyleVar("--clear-background-color", "#ffffff");
   await browser.tick();
-  // Then the resolved (light) theme is requested
+  // Then the resolved (light) theme and background are requested
   assert.deepEqual(browser.posts, [
-    ENDPOINT + "?theme=obsidian",
-    ENDPOINT + "?theme=moonstone",
+    ENDPOINT + "?theme=obsidian&color=%230b0c10",
+    ENDPOINT + "?theme=moonstone&color=%23ffffff",
+  ]);
+});
+
+test("color change with unchanged theme: posts the new background only", async () => {
+  // Given a dark parent theme
+  const browser = createBrowser({ parentTheme: "dark" });
+  browser.load();
+  // When HA tweaks the background color within the same luminance class
+  browser.setStyleVar("--clear-background-color", "#111111");
+  await browser.tick();
+  // Then the guard lets the new color through (theme unchanged)
+  assert.deepEqual(browser.posts, [
+    ENDPOINT + "?theme=obsidian&color=%230b0c10",
+    ENDPOINT + "?theme=obsidian&color=%23111111",
+  ]);
+});
+
+test("unparseable clear variable: the primary background is used instead", async () => {
+  // Given a dark parent theme
+  const browser = createBrowser({ parentTheme: "dark" });
+  browser.load();
+  // When HA sets the clear variable to a value the client cannot parse
+  browser.setStyleVar("--clear-background-color", "hsl(220, 10%, 10%)");
+  await browser.tick();
+  // Then the theme decision and the color both fall back to the primary variable
+  assert.deepEqual(browser.posts, [
+    ENDPOINT + "?theme=obsidian&color=%230b0c10",
+    ENDPOINT + "?theme=obsidian&color=%23111318",
   ]);
 });
 
@@ -402,8 +431,8 @@ test("rapid mutations: batched into a single delivery of the final state", async
   await browser.tick();
   // Then exactly one delivery of the final state happens
   assert.deepEqual(browser.posts, [
-    ENDPOINT + "?theme=obsidian",
-    ENDPOINT + "?theme=moonstone",
+    ENDPOINT + "?theme=obsidian&color=%230b0c10",
+    ENDPOINT + "?theme=moonstone&color=%23f5f7fa",
   ]);
 });
 
@@ -468,7 +497,7 @@ test("failed send: bounded retries, then the chain stops", async () => {
   await browser.tick();
   // Then exactly three attempts were made and no further retry is pending
   assert.equal(browser.posts.length, 3);
-  assert.equal(browser.posts[0], ENDPOINT + "?theme=obsidian");
+  assert.equal(browser.posts[0], ENDPOINT + "?theme=obsidian&color=%230b0c10");
   assert.equal(browser.pendingTimeouts(), 0);
 });
 
@@ -486,8 +515,8 @@ test("failed send: retries are delayed and re-read the current theme", async () 
   browser.setFetchBehavior("ok");
   browser.runTimeouts();
   await browser.tick();
-  // Then the retry delivers the current (light) theme
-  assert.ok(browser.posts.includes(ENDPOINT + "?theme=moonstone"));
+  // Then the retry delivers the current (light) theme with its background
+  assert.ok(browser.posts.includes(ENDPOINT + "?theme=moonstone&color=%23ffffff"));
 });
 
 test("404 response: no retry loop is scheduled", async () => {

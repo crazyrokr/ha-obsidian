@@ -13,6 +13,12 @@ requested theme is applied to it and the app is reloaded — no browser request
 needed. The watcher is event-driven on Linux (inotify on the config
 directory, idle cost zero) and degrades to a few seconds of polling only
 where inotify is unavailable.
+
+The desktop background follows the theme as well. In the base image the
+desktop is either an Xvfb server (X mode) or a labwc compositor nested
+inside Selkies' headless Wayland compositor (Wayland mode); the daemon keeps
+the background color in sync with the theme through xsetroot or swaybg
+respectively, re-applying it until (and after) the desktop is up.
 """
 
 from __future__ import annotations
@@ -50,6 +56,22 @@ DEFAULT_VAULT_WATCH_INTERVAL = 2.0
 # bound; the sweep rescan guards against events that were never delivered.
 DEFAULT_WAKE_TIMEOUT = 1.0
 DEFAULT_SWEEP_INTERVAL = 60.0
+
+# Default desktop background per theme, used when a request carries no color
+# (standalone tab, or an older client). Black matches the stock desktop; the
+# light value is HA's stock light-theme background.
+DEFAULT_BACKGROUND = {"obsidian": "#000000", "moonstone": "#f2f4f9"}
+# Background clients: swaybg paints the background layer of the nested labwc
+# compositor (Wayland mode); xsetroot sets the root window of Xvfb (X mode).
+DEFAULT_SWAYBG_COMMAND = ("/usr/bin/swaybg",)
+DEFAULT_XSETROOT_COMMAND = ("/usr/bin/xsetroot",)
+# How often the supervisor wakes: it restarts a dead background client (and
+# retries until the compositor is up in Wayland mode) and re-applies the
+# X root color on this cadence.
+DEFAULT_BACKGROUND_RETRY_INTERVAL = 2.0
+# X mode re-applies the root color on this cadence, so a restarted X server
+# or a client that repaints the root cannot leave a stale background.
+DEFAULT_BACKGROUND_REAPPLY_INTERVAL = 30.0
 
 # inotify(7) event masks: the config file appears, is rewritten in place, or
 # is swapped for a new inode. Obsidian (Electron) can do either — a temp file
@@ -117,6 +139,30 @@ def is_dark_color(value: str | None, threshold: float = 0.5) -> bool | None:
     if color is None:
         return None
     return relative_luminance(color) < threshold
+
+
+def format_hex(color: tuple[float, float, float, float]) -> str:
+    """Normalize a parsed (r, g, b, a) color to an opaque '#rrggbb' string."""
+    channels = [max(0, min(255, round(channel))) for channel in color[:3]]
+    return "#{:02x}{:02x}{:02x}".format(*channels)
+
+
+def normalize_requested_background(theme: str, color: str | None) -> str:
+    """Resolve the requested background color for a theme.
+
+    A missing color falls back to the theme default. An explicit color must
+    parse, and its darkness must agree with the theme — a light color with
+    the dark theme (or vice versa) is a client contract violation, rejected
+    with ValueError rather than painted.
+    """
+    if color is None:
+        return DEFAULT_BACKGROUND[theme]
+    parsed = parse_color(color)
+    if parsed is None:
+        raise ValueError(f"invalid color: {color!r}")
+    if is_dark_color(color) != (theme == "obsidian"):
+        raise ValueError(f"color {color!r} does not match theme {theme!r}")
+    return format_hex(parsed)
 
 
 def resolve_vault(
@@ -253,46 +299,84 @@ def handle_set_theme(
     env: dict | None = None,
     reloder: Callable[..., object] | None = None,
     obsidian_home: str | None = None,
+    color: str | None = None,
 ) -> dict:
-    """Apply a requested theme to the resolved vault and reload the app.
+    """Apply a requested theme (and optional background color) to the vault.
 
-    Persists the requested theme so the vault watcher can bring newly created
-    vaults in sync. Returns {"changed": bool, "reloaded": bool}. Raises
-    ValueError for a missing or unknown theme, OSError on write failure. The
-    reload is best-effort: a failure is reported as reloaded=False, never
-    raised.
+    Persists the requested theme and background so the vault watcher can
+    bring newly created vaults in sync and the desktop background can be
+    restored at boot. Returns {"changed": bool, "reloaded": bool,
+    "background": str}. Raises ValueError for a missing or unknown theme, an
+    invalid color, or a color whose darkness contradicts the theme; OSError
+    on write failure. The reload is best-effort: a failure is reported as
+    reloaded=False, never raised.
     """
     environment = dict(os.environ) if env is None else env
     home = obsidian_home or environment.get("OBSIDIAN_HOME") or DEFAULT_OBSIDIAN_HOME
     if theme is None:
         raise ValueError("missing theme")
+    if theme not in VALID_THEMES:
+        raise ValueError(f"unsupported theme: {theme!r}")
+    background = normalize_requested_background(theme, color)
     vault = resolve_vault(environment, obsidian_home=home)
     uid, gid = resolve_owner(environment)
     changed = apply_theme(vault, theme, uid, gid)
-    store_last_theme(theme, home)
+    store_last_theme(theme, home, background=background)
+    background_applied = apply_background(background)
     if not changed:
-        return {"changed": False, "reloaded": False}
+        return {
+            "changed": False,
+            "reloaded": False,
+            "background": background,
+            "background_applied": background_applied,
+        }
     reload = reloder if reloder is not None else reload_obsidian
     try:
         reloaded = bool(reload(env=environment))
     except Exception:  # noqa: BLE001 - reload is best-effort by contract
         reloaded = False
-    return {"changed": True, "reloaded": reloaded}
+    return {
+        "changed": True,
+        "reloaded": reloaded,
+        "background": background,
+        "background_applied": background_applied,
+    }
 
 
-def store_last_theme(theme: str, home: str = DEFAULT_OBSIDIAN_HOME) -> None:
-    """Persist the last requested theme for the vault watcher (best-effort).
+def _read_state(home: str) -> dict:
+    try:
+        with open(os.path.join(home, ".config", LAST_THEME_STATE_FILE), encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def store_last_theme(
+    theme: str, home: str = DEFAULT_OBSIDIAN_HOME, background: str | None = None
+) -> None:
+    """Persist the last requested theme (and background) (best-effort).
 
     The theme is already applied when this runs, so a failure is swallowed:
-    the watcher simply has nothing to apply until the next request.
+    the watcher simply has nothing to apply until the next request. When
+    `background` is None the previously stored background is kept, so a
+    request that only carries a theme cannot clobber a remembered color.
     """
     if theme not in VALID_THEMES:
         return
+    payload: dict = {"theme": theme}
+    if background is not None:
+        if parse_color(background) is not None:
+            payload["background"] = background
+    elif background is None:
+        stored = _read_state(home).get("background")
+        if isinstance(stored, str) and parse_color(stored) is not None:
+            payload["background"] = stored
     path = os.path.join(home, ".config", LAST_THEME_STATE_FILE)
     try:
         os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
         with open(path, "w", encoding="utf-8") as handle:
-            json.dump({"theme": theme}, handle)
+            json.dump(payload, handle)
             handle.write("\n")
     except OSError:
         pass
@@ -300,13 +384,21 @@ def store_last_theme(theme: str, home: str = DEFAULT_OBSIDIAN_HOME) -> None:
 
 def load_last_theme(home: str = DEFAULT_OBSIDIAN_HOME) -> str | None:
     """Read the persisted last requested theme; None when absent or invalid."""
-    try:
-        with open(os.path.join(home, ".config", LAST_THEME_STATE_FILE), encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, ValueError):
-        return None
-    theme = data.get("theme") if isinstance(data, dict) else None
+    theme = _read_state(home).get("theme")
     return theme if theme in VALID_THEMES else None
+
+
+def load_last_background(home: str = DEFAULT_OBSIDIAN_HOME) -> str | None:
+    """Read the persisted background color; None when absent or not a color.
+
+    The value is returned normalized to '#rrggbb' so the daemon can compare
+    it against request colors without re-parsing.
+    """
+    value = _read_state(home).get("background")
+    if not isinstance(value, str):
+        return None
+    parsed = parse_color(value)
+    return format_hex(parsed) if parsed is not None else None
 
 
 def registered_vaults(config_data: object) -> set[str]:
@@ -534,6 +626,275 @@ def run_vault_watcher(
         last_step = time.monotonic()
 
 
+def scan_process_comms(proc_dir: str = "/proc") -> dict[int, str]:
+    """Map every held file-inode to the comm of the process holding it.
+
+    Covers both socket fds (`socket:[N]` → N) and regular-file fds (the
+    target path's inode) — a Wayland server keeps its
+    `wayland-<n>.lock` open as a regular file, so the lock's inode names
+    its owner. Unreadable /proc entries (other users' processes) are
+    skipped; the daemon and the desktop stack all run as the same add-on
+    user, so the entries that matter are always visible.
+    """
+    mapping: dict[int, str] = {}
+    try:
+        entries = os.listdir(proc_dir)
+    except OSError:
+        return mapping
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        fd_dir = os.path.join(proc_dir, entry, "fd")
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        comm = ""
+        for fd in fds:
+            try:
+                link = os.readlink(os.path.join(fd_dir, fd))
+            except OSError:
+                continue
+            if link.startswith("socket:["):
+                inode = int(link[len("socket:["):-1])
+            else:
+                try:
+                    inode = os.stat(link).st_ino
+                except OSError:
+                    continue
+            if inode in mapping:
+                continue
+            if not comm:
+                try:
+                    with open(os.path.join(proc_dir, entry, "comm"), encoding="ascii") as handle:
+                        comm = handle.read().strip()
+                except OSError:
+                    comm = ""
+            mapping[inode] = comm
+    return mapping
+
+
+def find_labwc_display(runtime_dir: str, proc_map: dict[int, str]) -> str | None:
+    """Name of the Wayland display owned by a labwc server, if any.
+
+    Every Wayland server keeps `<XDG_RUNTIME_DIR>/wayland-<n>.lock` open while
+    it runs, so the lock's inode identifies its owner. In this image Selkies
+    owns the first display (it is the compositor being streamed) and labwc
+    runs nested inside it on the next free display — only a labwc-owned
+    display will actually render a background client.
+    """
+    try:
+        entries = sorted(os.listdir(runtime_dir))
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.startswith("wayland-") or not entry.endswith(".lock"):
+            continue
+        try:
+            inode = os.stat(os.path.join(runtime_dir, entry)).st_ino
+        except OSError:
+            continue
+        if proc_map.get(inode) == "labwc":
+            return entry[: -len(".lock")]
+    return None
+
+
+class DesktopBackground:
+    """Keep the desktop background color in sync with the requested theme.
+
+    The base image ships two desktop stacks, selected by PIXELFLUX_WAYLAND:
+    Xvfb on $DISPLAY (X mode), whose root window is painted with xsetroot,
+    and labwc nested inside Selkies' headless compositor (Wayland mode),
+    whose background layer is painted by a swaybg client of labwc.
+
+    The supervisor thread re-establishes the background whenever it is
+    missing: until the desktop is up (the spawn is deferred and retried),
+    and afterwards whenever the background client dies or, in X mode, every
+    reapply interval. All failures are swallowed — the background is a
+    cosmetic concern and must never break a theme request.
+    """
+
+    def __init__(
+        self,
+        env: dict | None = None,
+        swaybg_command: tuple[str, ...] = DEFAULT_SWAYBG_COMMAND,
+        xsetroot_command: tuple[str, ...] = DEFAULT_XSETROOT_COMMAND,
+        display: str | None = None,
+        reapply_interval: float | None = None,
+        proc_scan: Callable[[], dict[int, str]] = scan_process_comms,
+    ) -> None:
+        self.environment = dict(os.environ) if env is None else dict(env)
+        self.swaybg_command = tuple(swaybg_command)
+        self.xsetroot_command = tuple(xsetroot_command)
+        self.wayland_display = display
+        self.reapply_interval = (
+            DEFAULT_BACKGROUND_REAPPLY_INTERVAL
+            if reapply_interval is None
+            else reapply_interval
+        )
+        self.proc_scan = proc_scan
+        home = self.environment.get("HOME") or DEFAULT_OBSIDIAN_HOME
+        self.runtime_dir = (
+            self.environment.get("XDG_RUNTIME_DIR") or os.path.join(home, ".XDG")
+        )
+        self._is_wayland = self.environment.get("PIXELFLUX_WAYLAND", "").lower() == "true"
+        self._target: str | None = None
+        self._process: subprocess.Popen | None = None
+        self._last_applied: float | None = None
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------ state
+
+    @property
+    def target(self) -> str | None:
+        with self._lock:
+            return self._target
+
+    def set_color(self, color: str) -> bool:
+        """Adopt a background color; True when a client was (re)started now.
+
+        A color equal to the current target is a no-op. When the desktop is
+        not up yet the start is deferred to the supervisor, so False does
+        not mean the color was rejected — only that it is not running yet.
+        """
+        with self._lock:
+            if self._target == color:
+                return False
+            self._target = color
+            return self._start_locked()
+
+    def stop(self) -> None:
+        with self._lock:
+            self._target = None
+            self._stop_process_locked()
+
+    # -------------------------------------------------------- internals
+
+    def _stop_process_locked(self) -> None:
+        process, self._process = self._process, None
+        if process is None or process.poll() is not None:
+            return
+        with contextlib.suppress(OSError):
+            process.terminate()
+        with contextlib.suppress(subprocess.SubprocessError):
+            process.wait(timeout=2)
+        with contextlib.suppress(OSError):
+            process.kill()
+
+    def _start_locked(self) -> bool:
+        self._stop_process_locked()
+        if self._is_wayland:
+            display = self._wayland_display()
+            if display is None:
+                return False  # desktop not up yet; the supervisor retries
+            env = dict(self.environment)
+            env.setdefault("HOME", DEFAULT_OBSIDIAN_HOME)
+            env.setdefault("XDG_RUNTIME_DIR", self.runtime_dir)
+            env["WAYLAND_DISPLAY"] = display
+            command = (*self.swaybg_command, "-c", self._target)
+            try:
+                self._process = subprocess.Popen(
+                    list(command),
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except OSError:
+                return False
+            self._last_applied = time.monotonic()
+            return True
+        # X mode: xsetroot is one-shot; success is recorded and the
+        # supervisor re-applies on a cadence instead of tracking a process.
+        env = dict(self.environment)
+        env.setdefault("DISPLAY", ":1")
+        command = (*self.xsetroot_command, "-solid", self._target)
+        try:
+            result = subprocess.run(
+                list(command),
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if result.returncode != 0:
+            return False  # X server not up yet; the supervisor retries
+        self._last_applied = time.monotonic()
+        return True
+
+    def _wayland_display(self) -> str | None:
+        if self.wayland_display is not None:
+            return self.wayland_display
+        return find_labwc_display(self.runtime_dir, self.proc_scan())
+
+    def step(self) -> bool:
+        """Ensure the background client is alive (supervisor entry point).
+
+        True when the requested color is currently in effect. Never raises.
+        """
+        with self._lock:
+            if self._target is None:
+                return False
+            now = time.monotonic()
+            if self._is_wayland:
+                if self._process is not None and self._process.poll() is None:
+                    return True
+                return self._start_locked()
+            if (
+                self._last_applied is not None
+                and now - self._last_applied < self.reapply_interval
+            ):
+                return True
+            return self._start_locked()
+
+
+def run_background_supervisor(
+    manager: DesktopBackground,
+    stop: threading.Event | None = None,
+    interval: float = DEFAULT_BACKGROUND_RETRY_INTERVAL,
+) -> None:
+    """Keep the desktop background alive until stopped.
+
+    An idle supervisor wakes every `interval` seconds; each wake is a cheap
+    poll of the background client. A step that raises is swallowed, so the
+    supervisor can never die.
+    """
+    stop_event = stop if stop is not None else threading.Event()
+    while not stop_event.is_set():
+        stop_event.wait(interval)
+        if stop_event.is_set():
+            break
+        try:
+            manager.step()
+        except Exception:  # noqa: BLE001 - the supervisor must survive anything
+            pass
+
+
+# The daemon installs one manager here from main(); handle_set_theme routes
+# background requests through it, and tests substitute fakes.
+_background_manager: DesktopBackground | None = None
+
+
+def set_background_manager(manager: DesktopBackground | None) -> None:
+    global _background_manager
+    _background_manager = manager
+
+
+def apply_background(color: str) -> bool:
+    """Start or switch the desktop background to `color`; False when not.
+
+    Never raises: a missing manager or a failing client only leaves the
+    background stale, never the theme request in error.
+    """
+    if _background_manager is None:
+        return False
+    try:
+        return _background_manager.set_color(color)
+    except Exception:  # noqa: BLE001 - best-effort by contract
+        return False
+
+
 class ThemeRequestHandler(BaseHTTPRequestHandler):
     server_version = "ha-theme-sync"
     protocol_version = "HTTP/1.1"
@@ -543,9 +904,11 @@ class ThemeRequestHandler(BaseHTTPRequestHandler):
         if route.path.rstrip("/") != "/api/set-theme":
             self._respond(404, {"status": "error", "error": "not found"})
             return
-        theme = parse_qs(route.query).get("theme", [None])[0]
+        params = parse_qs(route.query)
+        theme = params.get("theme", [None])[0]
+        color = params.get("color", [None])[0]
         try:
-            result = handle_set_theme(theme)
+            result = handle_set_theme(theme, color=color)
         except ValueError as error:
             self._respond(400, {"status": "error", "error": str(error)})
             return
@@ -567,6 +930,20 @@ def main() -> None:
     host = os.environ.get("THEME_SYNC_HOST", DEFAULT_BIND_HOST)
     port = int(os.environ.get("THEME_SYNC_PORT", str(DEFAULT_BIND_PORT)))
     home = os.environ.get("OBSIDIAN_HOME") or DEFAULT_OBSIDIAN_HOME
+    # Restore the remembered desktop background once the desktop is up; the
+    # supervisor retries until then and keeps the background client alive.
+    background = DesktopBackground(env=os.environ)
+    set_background_manager(background)
+    remembered = load_last_background(home)
+    if remembered is not None:
+        background.set_color(remembered)
+    background_supervisor = threading.Thread(
+        target=run_background_supervisor,
+        kwargs={"manager": background},
+        name="ha-theme-sync-background",
+        daemon=True,
+    )
+    background_supervisor.start()
     watcher = threading.Thread(
         target=run_vault_watcher,
         kwargs={"home": home},

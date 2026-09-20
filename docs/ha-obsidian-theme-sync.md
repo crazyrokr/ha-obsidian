@@ -18,17 +18,21 @@ Browser (Selkies dashboard page)
   │  2. falls back to prefers-color-scheme (standalone tab)
   │  3. classifies by WCAG relative luminance (any HA theme, not just stock)
   ▼
-POST <page-origin><page-path>/api/set-theme?theme=obsidian|moonstone
+POST <page-origin><page-path>/api/set-theme?theme=obsidian|moonstone[&color=#rrggbb]
   ▼
 nginx (port 3000/3001, location /api/set-theme)
   ▼
 theme_server.py  (s6 service, loopback 127.0.0.1:8090, runs as abc)
-  ▼
-<vault>/.obsidian/appearance.json   (atomic write, keys preserved, abc-owned)
-  ▼
-obsidian-cli reload  (CLI client, best-effort, only when the value changed)
-  ▼
-Obsidian applies the theme live, without restarting the add-on
+  ├──▶ <vault>/.obsidian/appearance.json   (atomic write, keys preserved, abc-owned)
+  │      ▼
+  │      obsidian-cli reload  (CLI client, best-effort, only when the value changed)
+  │      ▼
+  │      Obsidian applies the theme live, without restarting the add-on
+  │
+  └──▶ desktop background  (the black background behind the streamed session is
+         painted in the same color: xsetroot on Xvfb in X mode, a swaybg client
+         of the nested labwc compositor in Wayland mode; a supervisor thread
+         keeps it up, and the last color is restored at boot)
 ```
 
 Key properties:
@@ -54,6 +58,23 @@ Key properties:
   theme applied and the app reloaded — no browser request needed. Vault
   paths that existed before the watcher started are never overwritten, so a
   user-chosen custom theme is left untouched.
+- **The desktop background mirrors the theme's color.** The client posts the
+  exact HA background color (the `color=` parameter, read from the same first
+  parseable candidate the theme decision uses) whenever it can read it; the
+  daemon validates that the color's darkness agrees with the theme (a light
+  color for the dark theme is rejected with 400 — the desktop must never go
+  light under a dark theme), falls back to a per-theme default
+  (`#000000` dark, `#f2f4f9` light) when the color is missing, and remembers
+  the last color in the existing state file, restoring it at boot. The base
+  image ships two desktop stacks, so both are supported: in X mode
+  (`PIXELFLUX_WAYLAND=false`, the shipped configuration) `xsetroot -solid`
+  paints Xvfb's root window and is re-applied on a 30 s cadence; in Wayland
+  mode a `swaybg` process runs as a client of the *nested* labwc compositor
+  (discovered from the `wayland-*.lock` file held by the process named
+  `labwc`) and is respawned whenever it dies. A supervisor thread
+  re-establishes the background until the desktop is up, so the color also
+  survives a desktop restart. All background failures are swallowed — the
+  background is a cosmetic concern and never fails a theme request.
 - **The running app is reloaded through the Obsidian CLI.** At boot, the
   `init-obsidian-cli` s6-rc oneshot merges `"cli": true` into the global
   config (the key the app gates every CLI command on). After an actual
@@ -121,14 +142,11 @@ Verified against the actual base image
 ```text
 obsidian/
 ├── Dockerfile                              # merged: pinned base + theme-sync layer
-├── config.yaml                             # unchanged (ingress, ports, maps)
-├── adr/
-│   └── 0001-obsidian-ha-theme-sync.md      # architecture decision record
-├── ha-theme-sync/
-│   ├── theme_server.py                     # daemon (stdlib only)
-│   ├── theme-sync.js                       # client detection
-│   └── test_theme_server.py                # pytest suite (Given-When-Then)
+├── config.yaml                             # add-on manifest (ingress, ports, maps)
 └── root/
+    ├── opt/ha-theme-sync/
+    │   ├── theme_server.py                 # daemon (stdlib only)
+    │   └── theme-sync.js                   # client detection
     ├── etc/services.d/theme-api/run        # s6 longrun service
     └── etc/s6-overlay/s6-rc.d/
         ├── init-obsidian-cli/              # boot-time oneshot: CLI enablement
@@ -137,6 +155,13 @@ obsidian/
         │   ├── up
         │   └── dependencies.d/init-obsidian-config
         └── user/contents.d/init-obsidian-cli
+docs/
+├── adr/
+│   └── 0001-obsidian-ha-theme-sync.md      # architecture decision record
+└── ha-obsidian-theme-sync.md               # this document
+tests/
+├── test_theme_server.py                    # pytest suite (Given-When-Then)
+└── theme-sync.test.js                      # node --test suite (fake browser)
 ```
 
 ---
@@ -167,15 +192,46 @@ active vault, safely.
     `subprocess.run(check=True, timeout=15)` with explicit
     `HOME`/`XDG_RUNTIME_DIR`; never raises, returns `False` when the CLI or
     the app is unavailable.
+  - `format_hex()` / `normalize_requested_background()` — normalize a
+    parsed color to opaque `#rrggbb`, and resolve a requested background
+    color: a missing color becomes the theme default; an explicit color
+    must parse and its darkness must agree with the theme, otherwise the
+    request is rejected (a light color under the dark theme is a client
+    contract violation, never painted).
   - `handle_set_theme()` — orchestrates vault/owner resolution,
-    `apply_theme`, persists the requested theme for the watcher (even for a
-    no-op request, so the remembered theme is always the last one asked
-    for), then `reload_obsidian` only when the value actually changed;
-    returns `{"changed": bool, "reloaded": bool}`.
+    `apply_theme`, persists the requested theme *and background* for the
+    watcher and the boot restore (even for a no-op request, so the
+    remembered theme is always the last one asked for), applies the
+    background through the installed `DesktopBackground` manager
+    (best-effort, reported as `background_applied`), then
+    `reload_obsidian` only when the value actually changed; returns
+    `{"changed": bool, "reloaded": bool, "background": str,
+    "background_applied": bool}`.
   - `store_last_theme()` / `load_last_theme()` — persist the last requested
-    theme at `<home>/.config/ha-theme-sync.json`; storing is best-effort
-    (a failure only leaves the watcher with nothing to apply), loading
-    returns `None` for a missing, corrupt or disallowed value.
+    theme (and, since the desktop background, its background color) at
+    `<home>/.config/ha-theme-sync.json`; storing is best-effort (a failure
+    only leaves the watcher with nothing to apply), loading returns `None`
+    for a missing, corrupt or disallowed value.
+  - `load_last_background()` — read the remembered background color,
+    normalized to `#rrggbb`; `None` when absent or not a color. The daemon
+    restores it at boot once the desktop is up.
+  - `scan_process_comms()` / `find_labwc_display()` — map every held
+    file-inode to the comm of its owner (`/proc/*/fd` readlinks: socket
+    inodes directly, regular files through their target path — a Wayland
+    server keeps its `wayland-<n>.lock` open as a *regular file*, so the
+    lock's inode names its owner; unreadable entries skipped), then name
+    the Wayland display whose lock is held by a process called `labwc`.
+    In this image Selkies owns the first display (the headless compositor
+    that is streamed) and labwc runs *nested* inside it; only a labwc-owned
+    display renders a background client, so painting the Selkies display
+    would be invisible.
+  - `DesktopBackground` / `run_background_supervisor()` — keep the desktop
+    background in the requested color. Wayland mode: a `swaybg` process
+    with the discovered display as environment, restarted whenever it dies,
+    spawn deferred until the desktop exists. X mode: `xsetroot -solid`
+    (one-shot), re-applied every 30 s and retried until the X server is up.
+    A supervisor thread steps the manager every 2 s; a step that raises is
+    swallowed, so the background can never crash the daemon.
   - `registered_vaults()` — the existing vault paths recorded in Obsidian's
     global config; non-dict configs, non-dict entries and non-existent
     paths are skipped.
@@ -210,6 +266,10 @@ active vault, safely.
 - Same luminance logic as the daemon (mirrored in JS), reading
   `--clear-background-color` / `--primary-background-color` from
   `window.parent`; cross-origin failures degrade to `prefers-color-scheme`.
+  The same first parseable candidate is posted as the `color=` parameter,
+  so the desktop background is the exact HA background, not a guess; on the
+  fallback path (standalone, cross-origin, or colorless parent) no color is
+  sent and the daemon applies its per-theme default.
 - Endpoint built from `window.location` (ingress-safe, see Section 1).
 - Runs on load, then event-driven (no periodic polling): the
   `prefers-color-scheme` change event covers the fallback path, and a
@@ -221,10 +281,12 @@ active vault, safely.
 - A failed send is retried a bounded number of times (3 attempts, 2 s
   apart, re-reading the current theme), so a transient error at the moment
   of a switch cannot lose the sync; 404 responses are not retried.
-- `tests/theme-sync.test.js` — 18 Given-When-Then tests under
+- `tests/theme-sync.test.js` — 20 Given-When-Then tests under
   `node --test` (zero dependencies) that load the real script into a fake
   browser: spec-faithful `MutationObserver` delivery, `matchMedia` change
-  events, recorded `fetch`/timers.
+  events, recorded `fetch`/timers — including the background-color
+  deliveries (color with unchanged theme, unparseable candidate falling back
+  to the primary variable).
 
 **Verify.** `node --test "tests/*.test.js"` all green;
 served file check (Step 5) + end-to-end smoke test (Section 6).
@@ -251,6 +313,9 @@ user from the start (matching LSIO's own service pattern).
 - Copy `theme_server.py` + `theme-sync.js` to `/opt/ha-theme-sync/`, the
   longrun service to `/etc/services.d/theme-api/`, and `chmod +x` the run
   script.
+- Install `swaybg` (Debian package) for the Wayland-mode desktop background;
+  `xsetroot` for the X-mode root window already ships with the base image
+  via `x11-xserver-utils`.
 - Install the `init-obsidian-cli` s6-rc oneshot under
   `/etc/s6-overlay/s6-rc.d/` (type `oneshot`, depending on the base image's
   `init-obsidian-config`) and add it to the `user` bundle, so `"cli": true`
@@ -281,13 +346,26 @@ both locations (Section 6).
 - `obsidian/adr/0001-obsidian-ha-theme-sync.md` records the decision, the
   rejected alternatives (runtime sed, `apk`, KasmVNC injection, string-based
   detection) and the consequences.
-- `tests/test_theme_server.py` — 136 Given-When-Then tests covering
+- `tests/test_theme_server.py` — 205 Given-When-Then tests covering
   parsing edge cases, threshold boundaries, vault resolution fall-throughs,
   atomicity, ownership, CLI reload success/failure paths, CLI enablement
   merges, API status codes and idempotency, the remembered-theme state
   (round-trip, allowlist, corruption, swallowed failures) and the vault
   watcher (baseline, new-vault sync, re-creation after removal, corrupt
   config, no-op registries, multi-vault reload coalescing, loop survival).
+  The desktop-background layer is covered with fake subprocesses and fake
+  runtime directories: color normalization and the theme/color consistency
+  check (including the 0.5 luminance boundary), the remembered-background
+  state (round-trip, normalization, RMW-keep, corruption), nested-display
+  discovery (lock inodes owned by `labwc` vs Selkies, broken symlinks,
+  missing directories), the Wayland manager (spawn on the labwc display,
+  deferral until the desktop is up, replace on color switch, respawn on
+  death, explicit display, missing binary, stop), the X-mode manager
+  (apply, retry until the X server is up, reapply cadence, no-op, missing
+  binary), the supervisor loop (restart, retry-until-compositor, survival
+  of failing steps), `handle_set_theme` with a background (stored, applied,
+  rejected, no-op-theme color change, failing manager), and the HTTP
+  endpoint's `color` parameter.
 - `tests/theme-sync.test.js` — the client's event-driven behavior
   (scheme change, parent mutations, guard, bounded retries, no polling)
   under `node --test` with a fake browser.
@@ -310,7 +388,10 @@ on the run script.
 3. **API:**
    - `POST /api/set-theme?theme=moonstone` → 200, `changed:true`;
    - again → 200, `changed:false`;
-   - `?theme=purple` → 400; no theme → 400; other path → 404.
+   - `?theme=purple` → 400; no theme → 400; other path → 404;
+   - `?theme=moonstone&color=%23f2f4f9` → 200, `background:"#f2f4f9"`;
+   - `?theme=obsidian&color=%23ffffff` → 400 (dark theme, light color);
+   - `?theme=moonstone&color=%23zz` → 400 (not a color).
 4. **Vault file:** `cat <vault>/.obsidian/appearance.json` shows
    `"theme": "moonstone"`, owned by the add-on user, other keys intact.
 5. **Live apply:** switch the HA theme and confirm the running Obsidian
@@ -319,7 +400,15 @@ on the run script.
    `obsidian-cli reload` succeeded. If
    `"reloaded"` is `false` (CLI unavailable), restart the app once — the
    file is already correct, so the theme applies on next start.
-6. **Failure modes:**
+6. **Desktop background:** open the streamed desktop (with Obsidian out of
+   the way) and confirm the background behind it is the theme's color
+   instead of black — the exact HA color when the page was under ingress,
+   the per-theme default otherwise. In X mode `xsetroot` applies
+   immediately; in Wayland mode `swaybg` must be running as a client of the
+   labwc display (`ps` + `WAYLAND_DISPLAY` of that process). After a
+   daemon restart the remembered color from
+   `/config/.config/ha-theme-sync.json` comes back once the desktop is up.
+7. **Failure modes:**
    - *404 from HA core on the POST* → the page is not under ingress and the
      endpoint derivation regressed; check `theme-sync.js` endpoint logic.
    - *Permission errors on appearance.json* → the daemon is not running as
@@ -342,3 +431,10 @@ on the run script.
      Vault paths that already existed when the daemon started — including
      ones created before a daemon restart — are left as-is by design,
      including user-chosen custom themes.
+   - *The desktop stays black* → in X mode the X server is not up yet (the
+     supervisor retries until it is — check `xset q` as the add-on user);
+     in Wayland mode `swaybg` is missing (installed at build time,
+     `dpkg -l swaybg`) or no labwc-owned display exists yet (the spawn is
+     deferred until one does). A failing paint is reported as
+     `background_applied:false` in the API response and never fails the
+     theme write.

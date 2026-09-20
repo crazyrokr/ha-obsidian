@@ -2,6 +2,13 @@ FROM lscr.io/linuxserver/obsidian:v1.13.7-ls144@sha256:c6c86336a2cf57506b0db2beb
 
 RUN mkdir /share
 
+# The theme-sync daemon keeps the desktop background in the theme's color.
+# swaybg paints the nested labwc compositor in Wayland mode; in X mode the
+# root window is painted with xsetroot, already present via x11-xserver-utils.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends swaybg \
+ && rm -rf /var/lib/apt/lists/*
+
 COPY root /
 
 # Durable web hooks: the nginx config and the dashboard are regenerated from
