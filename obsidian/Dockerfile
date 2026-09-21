@@ -21,4 +21,4 @@ LABEL \
   org.opencontainers.image.title="Home Assistant Obsidian" \
   org.opencontainers.image.description="Runs Obsidian within your Home Assistant setup providing integration of live-features" \
   org.opencontainers.image.source="https://github.com/crazyrokr/ha-obsidian/tree/main/obsidian" \
-  org.opencontainers.image.licenses="Apache License 2.0"
+  org.opencontainers.image.licenses="MIT"
