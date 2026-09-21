@@ -1,0 +1,5 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+# Runs the HA theme sync daemon as the abc account so that files it writes
+# into /config are owned by the add-on user.
+exec s6-setuidgid abc python3 /opt/ha-theme-sync/theme_server.py
