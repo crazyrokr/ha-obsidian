@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-09-06
-- Last updated: 2026-09-20
+- Last updated: 2026-09-21
 - Deciders: maintainers
 
 ## Context
@@ -150,6 +150,36 @@ detects the HA theme and posts it to the daemon through nginx.
    background without the exact color — the color is already read
    client-side, so posting it costs nothing and matches the requested
    behavior.
+10. **The Selkies web UI itself follows the theme.** The pre-stream screen
+    ("Waiting for stream") and the letterbox bars while streaming are
+    painted by a body style Selkies injects at runtime with a hardcoded
+    `#000` background — verified against the pinned base image: the
+    dashboard core appends `body{background-color:#000; color:#fff; …}`
+    to `<head>` both when the dashboard loads and when the stream view
+    mounts — a rule its own theme system (which themes the sidebar and
+    settings chrome) never reaches. The client therefore pins the body
+    background to the requested color with an `!important` rule in its own
+    `<style id="ha-theme-sync-style">` element: `!important` outranks the
+    app's rule regardless of injection order, and the rule is refreshed on
+    every sync, so live HA switches retint the screen without a reload.
+    The exact HA color is used when readable; the fallback path uses the
+    same per-theme defaults the daemon paints the desktop with
+    (`#000000` dark, `#f2f4f9` light). The "Connecting…" status bar at the
+    bottom of the screen keeps its own translucent dark strip with white
+    text, which stays legible under both luminance classes, so it is not
+    overridden. Separately, the dashboard chrome (sidebar, settings,
+    notifications) is themed from `localStorage["theme"]`, which the app
+    reads once at startup (`getItem("theme") || "dark"`); the client seeds
+    that key with `dark`/`light` before the app bundle runs — the script is
+    a classic `<script>` in `<head>` and always executes before the
+    deferred module bundle — and refreshes it on every sync, so the chrome
+    matches HA from first paint and on later loads. Storage may be
+    unavailable (private mode); the seed is best-effort and the app simply
+    keeps its own default. Rejected alternative: patching Selkies'
+    `selkies-core.js` at build time to change the injected color — the
+    hardcoded rule is version-specific markup that a base-image bump would
+    change (and the build-time grep guard would need a second anchor),
+    while the one-rule override depends only on CSS cascade order.
 
 ## Consequences
 
@@ -198,3 +228,8 @@ detects the HA theme and posts it to the daemon through nginx.
   config, so the impact surface is negligible.
 - The `selkies-dashboard-wish` dashboard variant is not instrumented; the
   add-on uses the default `selkies-dashboard`.
+- The client now also writes `localStorage["theme"]` in the add-on UI's
+  origin. The value is constrained to the app's own two values and follows
+  the HA theme, the same contract as the vault's `appearance.json`; the
+  write is best-effort (private-mode browsers simply keep the app default)
+  and it never affects the theme request itself.

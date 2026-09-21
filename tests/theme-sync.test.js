@@ -66,17 +66,48 @@ function createBrowser(options = {}) {
     };
   }
 
+  // The parent HA window's document — what the MutationObserver watches.
   const documentElement = makeElement("html");
-  const head = makeElement("head");
   const body = makeElement("body");
-  head.parentNode = documentElement;
   body.parentNode = documentElement;
-  documentElement.children = [head, body];
+  documentElement.children = [body];
   if (options.parentTheme) {
     documentElement.attributes.theme = options.parentTheme;
   }
+  const parentDocument = {
+    documentElement,
+    body,
+    readyState: "complete",
+  };
 
-  const fakeDocument = { documentElement, readyState: "complete" };
+  // Our page's document — where the script injects its style element. Kept
+  // separate from the parent document, as in a real browser: appends here
+  // must not reach the parent's observer.
+  const pageElement = makeElement("html");
+  const head = makeElement("head");
+  const pageBody = makeElement("body");
+  head.parentNode = pageElement;
+  pageBody.parentNode = pageElement;
+  pageElement.children = [head, pageBody];
+  const fakeDocument = {
+    documentElement: pageElement,
+    head,
+    body: pageBody,
+    readyState: "complete",
+    createElement: makeElement,
+    getElementById(id) {
+      let found = null;
+      (function scan(node) {
+        if (found) return;
+        if (node.id === id) {
+          found = node;
+          return;
+        }
+        node.children.forEach(scan);
+      })(pageElement);
+      return found;
+    },
+  };
 
   function getComputedStyle(element) {
     computedStyleReads += 1;
@@ -189,12 +220,36 @@ function createBrowser(options = {}) {
           throw new Error("SecurityError: cross-origin access denied");
         },
       }
-    : { document: fakeDocument, getComputedStyle, MutationObserver };
+    : { document: parentDocument, getComputedStyle, MutationObserver };
+
+  // The app chrome reads localStorage["theme"] at startup; the fake mirrors
+  // the real store (per-origin, string values), or throws when storage is
+  // unavailable (private mode).
+  const storageData = {};
+  const fakeStorage = options.noLocalStorage
+    ? {
+        setItem() {
+          throw new Error("SecurityError: storage unavailable");
+        },
+        getItem() {
+          throw new Error("SecurityError: storage unavailable");
+        },
+      }
+    : {
+        setItem(key, value) {
+          storageData[key] = String(value);
+        },
+        getItem(key) {
+          return key in storageData ? storageData[key] : null;
+        },
+      };
 
   const window = {
     location: { href: "https://ha.example.com/api/ingress/t0k3n/" },
     matchMedia,
     parent: parentWindow,
+    document: fakeDocument,
+    localStorage: fakeStorage,
   };
   if (options.noParent) {
     window.parent = window; // top-level tab: window.parent === window
@@ -250,6 +305,11 @@ function createBrowser(options = {}) {
     documentElement,
     head,
     body,
+    localStorage: fakeStorage,
+    styleRule() {
+      const style = fakeDocument.getElementById("ha-theme-sync-style");
+      return style ? style.textContent : null;
+    },
     createElement: makeElement,
     computedStyleReads: () => computedStyleReads,
     setFetchBehavior(behavior) {
@@ -528,4 +588,115 @@ test("404 response: no retry loop is scheduled", async () => {
   // Then a single POST happened and no retry was armed
   assert.equal(browser.posts.length, 1);
   assert.equal(browser.pendingTimeouts(), 0);
+});
+
+test("pre-stream screen: the exact HA color re-themes the black screen on load", () => {
+  // Given the add-on UI is embedded in a dark-themed HA window
+  const browser = createBrowser({ parentTheme: "dark" });
+  // When the page loads
+  browser.load();
+  // Then a style rule pins the body background to the exact HA color
+  // (!important outranks the app's hardcoded black rule)
+  assert.equal(
+    browser.styleRule(),
+    "body{background-color:#0b0c10!important}"
+  );
+});
+
+test("pre-stream screen: the fallback path uses the per-theme default color", () => {
+  // Given a standalone tab on a light scheme (no HA color readable)
+  const browser = createBrowser({ noParent: true, localScheme: "light" });
+  // When the page loads
+  browser.load();
+  // Then the screen follows the light theme's default background
+  assert.equal(
+    browser.styleRule(),
+    "body{background-color:#f2f4f9!important}"
+  );
+});
+
+test("pre-stream screen: a live HA switch re-tints the same style element", async () => {
+  // Given a dark HA theme
+  const browser = createBrowser({ parentTheme: "dark" });
+  browser.load();
+  assert.equal(
+    browser.styleRule(),
+    "body{background-color:#0b0c10!important}"
+  );
+  // When HA switches to a light theme
+  browser.setParentTheme("light");
+  await browser.tick();
+  // Then the existing style element is re-tinted (not duplicated) and
+  // the light theme is requested
+  assert.equal(
+    browser.styleRule(),
+    "body{background-color:#ffffff!important}"
+  );
+  assert.equal(
+    browser.head.children.filter((node) => node.id === "ha-theme-sync-style").length,
+    1
+  );
+  assert.deepEqual(browser.posts, [
+    ENDPOINT + "?theme=obsidian&color=%230b0c10",
+    ENDPOINT + "?theme=moonstone&color=%23ffffff",
+  ]);
+});
+
+test("pre-stream screen: repeated switches never duplicate the style element", async () => {
+  // Given a dark HA theme
+  const browser = createBrowser({ parentTheme: "dark" });
+  browser.load();
+  // When the HA theme flips several times
+  browser.setParentTheme("light");
+  await browser.tick();
+  browser.setStyleVar("--clear-background-color", "#111111");
+  await browser.tick();
+  browser.setParentTheme("dark");
+  await browser.tick();
+  // Then exactly one style element exists and it carries the final color
+  // (the inline #111111 override is still in effect under the dark theme)
+  const styles = browser.head.children.filter(
+    (node) => node.id === "ha-theme-sync-style"
+  );
+  assert.equal(styles.length, 1);
+  assert.equal(
+    styles[0].textContent,
+    "body{background-color:#111111!important}"
+  );
+});
+
+test("dashboard chrome: the app's stored theme is seeded to match HA on load", () => {
+  // Given the add-on UI is embedded in a light-themed HA window
+  const browser = createBrowser({ parentTheme: "light" });
+  // When the page loads
+  browser.load();
+  // Then the stored chrome theme is the app's light value
+  assert.equal(browser.localStorage.getItem("theme"), "light");
+
+  // Given a dark HA theme
+  const darkBrowser = createBrowser({ parentTheme: "dark" });
+  darkBrowser.load();
+  // Then the stored chrome theme is the app's dark value
+  assert.equal(darkBrowser.localStorage.getItem("theme"), "dark");
+});
+
+test("dashboard chrome: the stored theme follows live HA switches", async () => {
+  // Given a dark HA theme
+  const browser = createBrowser({ parentTheme: "dark" });
+  browser.load();
+  assert.equal(browser.localStorage.getItem("theme"), "dark");
+  // When HA switches to a light theme
+  browser.setParentTheme("light");
+  await browser.tick();
+  // Then the stored chrome theme is updated for the next app start
+  assert.equal(browser.localStorage.getItem("theme"), "light");
+});
+
+test("dashboard chrome: unavailable storage does not break the sync", () => {
+  // Given storage is unavailable (private mode)
+  const browser = createBrowser({ parentTheme: "dark", noLocalStorage: true });
+  // When the page loads
+  browser.load();
+  // Then the theme is still posted and nothing crashed
+  assert.deepEqual(browser.posts, [ENDPOINT + "?theme=obsidian&color=%230b0c10"]);
 });

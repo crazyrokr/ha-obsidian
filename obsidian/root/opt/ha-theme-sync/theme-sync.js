@@ -1,11 +1,16 @@
-/* Synchronizes the in-container Obsidian theme — and the desktop background
- * behind it — with the active Home Assistant theme. Runs in the add-on web
- * UI: when embedded via HA ingress the parent window is same-origin and HA's
- * theme variables are readable; otherwise the browser color scheme is used
+/* Synchronizes the in-container Obsidian theme — the desktop background
+ * behind it, and Selkies' own dashboard chrome and pre-stream screen —
+ * with the active Home Assistant theme. Runs in the add-on web UI: when
+ * embedded via HA ingress the parent window is same-origin and HA's theme
+ * variables are readable; otherwise the browser color scheme is used
  * as the fallback.
  *
  * The theme is always posted; the exact HA background color is posted along
  * with it when readable, so the desktop can mirror it instead of guessing.
+ *
+ * The script is a classic <script> in <head>, so it executes before the
+ * deferred app bundle: the screen override and the seeded chrome theme are
+ * already in place for the app's first paint.
  *
  * Re-syncs are event-driven, not polled. The prefers-color-scheme change
  * event covers the fallback, and a MutationObserver on the parent document
@@ -104,6 +109,47 @@
     return { theme: localTheme(), color: null };
   }
 
+  /* Selkies paints its pre-stream screen (and the letterbox bars while
+   * streaming) with a hardcoded black body style it injects at runtime,
+   * which its own theme system does not reach. An !important rule from our
+   * own <style> element outranks that rule regardless of injection order,
+   * so the screen re-themes with a one-rule override. The exact HA color is
+   * used when readable; otherwise the same per-theme defaults the daemon
+   * paints the desktop with.
+   */
+  var SCREEN_DEFAULTS = { obsidian: "#000000", moonstone: "#f2f4f9" };
+
+  function applyScreenColor(state) {
+    var color = state.color || SCREEN_DEFAULTS[state.theme];
+    if (!color) return;
+    var page = window.document;
+    var style = page.getElementById("ha-theme-sync-style");
+    if (!style) {
+      style = page.createElement("style");
+      style.id = "ha-theme-sync-style";
+      page.head.appendChild(style);
+    }
+    style.textContent = "body{background-color:" + color + "!important}";
+  }
+
+  /* The dashboard chrome (sidebar, settings, notifications) is themed from
+   * localStorage["theme"], which the app reads once at startup. Seeding it
+   * before the app bundle runs matches the chrome on first paint, and
+   * refreshing it on every sync keeps later loads in step. Best-effort:
+   * storage may be unavailable (private mode), where the app keeps its own
+   * default.
+   */
+  function applyUiTheme(state) {
+    try {
+      window.localStorage.setItem(
+        "theme",
+        state.theme === "obsidian" ? "dark" : "light"
+      );
+    } catch (error) {
+      /* Unavailable storage: the app keeps its own default theme. */
+    }
+  }
+
   /* The page is served under the ingress path (/api/ingress/<token>) when
    * embedded, so the endpoint must be derived from the page location instead
    * of a hardcoded absolute path. Captured once at load time, before any
@@ -122,7 +168,10 @@
    */
   function sync() {
     consecutiveFailures = 0;
-    attemptDelivery();
+    var state = currentTheme();
+    applyScreenColor(state);
+    applyUiTheme(state);
+    attemptDelivery(state);
   }
 
   /* The guard key covers theme AND color: a background-color change with an
@@ -133,8 +182,15 @@
     return state.theme + "|" + (state.color || "");
   }
 
-  function attemptDelivery() {
-    var state = currentTheme();
+  /* The state may be passed in (sync() already read it for the screen and
+   * chrome); a retry with no argument re-reads the current theme and
+   * re-derives the screen and chrome from it. */
+  function attemptDelivery(state) {
+    if (!state) {
+      state = currentTheme();
+      applyScreenColor(state);
+      applyUiTheme(state);
+    }
     if (deliveryKey(state) === lastSent) return;
     lastSent = deliveryKey(state);
     var query = "theme=" + encodeURIComponent(state.theme);

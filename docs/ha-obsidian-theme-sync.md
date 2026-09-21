@@ -13,10 +13,18 @@ defects found in that draft; the rest is the corrected, implemented design.
 
 ```text
 Browser (Selkies dashboard page)
-  │  theme-sync.js (injected into the dashboard source HTML)
+  │  theme-sync.js (injected into the dashboard source HTML, runs before
+  │  the app bundle: classic <script> in <head> vs. deferred module)
   │  1. reads HA theme vars from window.parent (same-origin via ingress)
   │  2. falls back to prefers-color-scheme (standalone tab)
   │  3. classifies by WCAG relative luminance (any HA theme, not just stock)
+  │
+  │  also re-themes the page itself:
+  │  4. pins the body background (the pre-stream "Waiting for stream"
+  │     screen and the streaming letterbox bars — black by Selkies'
+  │     hardcoded runtime style) to the HA color with an !important rule
+  │  5. seeds localStorage["theme"] so the dashboard chrome (sidebar,
+  │     settings, notifications) matches from first paint
   ▼
 POST <page-origin><page-path>/api/set-theme?theme=obsidian|moonstone[&color=#rrggbb]
   ▼
@@ -75,6 +83,19 @@ Key properties:
   re-establishes the background until the desktop is up, so the color also
   survives a desktop restart. All background failures are swallowed — the
   background is a cosmetic concern and never fails a theme request.
+- **The Selkies web UI itself follows the theme.** The pre-stream screen
+  ("Waiting for stream") and the letterbox bars while streaming are
+  painted by a body style Selkies injects at runtime with a hardcoded black
+  background that its own theme system does not reach, so the client pins
+  the body background to the requested color with an `!important` rule in
+  its own `<style>` element (exact HA color when readable, the daemon's
+  per-theme default otherwise) and refreshes it on every sync — a live HA
+  switch retints the screen without a reload. The bottom "Connecting…"
+  status bar keeps its translucent dark strip (legible in both themes).
+  The dashboard chrome (sidebar, settings, notifications) is themed from
+  `localStorage["theme"]`, which the app reads once at startup; the
+  script runs before the deferred app bundle, so it seeds that key in time
+  for first paint and keeps it current on every sync.
 - **The running app is reloaded through the Obsidian CLI.** At boot, the
   `init-obsidian-cli` s6-rc oneshot merges `"cli": true` into the global
   config (the key the app gates every CLI command on). After an actual
@@ -281,12 +302,29 @@ active vault, safely.
 - A failed send is retried a bounded number of times (3 attempts, 2 s
   apart, re-reading the current theme), so a transient error at the moment
   of a switch cannot lose the sync; 404 responses are not retried.
-- `tests/theme-sync.test.js` — 20 Given-When-Then tests under
+- **Re-theming the Selkies page itself.** Because the script executes
+  before the deferred app bundle (classic `<script>` in `<head>`), it can
+  prepare the page for first paint: it pins the body background — the
+  pre-stream "Waiting for stream" screen and the streaming letterbox bars,
+  black by a body style Selkies injects at runtime with a hardcoded `#000`
+  that its own theme system does not reach — to the requested color with
+  an `!important` rule in its own `<style id="ha-theme-sync-style">`
+  element (exact HA color when readable, the daemon's per-theme default
+  otherwise), refreshed on every sync so live switches retint the screen
+  without a reload; and it seeds `localStorage["theme"]` (best-effort,
+  `dark`/`light`), which the app reads once at startup for its chrome
+  (sidebar, settings, notifications). The status bar label keeps its own
+  translucent dark strip, legible in both themes.
+- `tests/theme-sync.test.js` — 27 Given-When-Then tests under
   `node --test` (zero dependencies) that load the real script into a fake
   browser: spec-faithful `MutationObserver` delivery, `matchMedia` change
-  events, recorded `fetch`/timers — including the background-color
-  deliveries (color with unchanged theme, unparseable candidate falling back
-  to the primary variable).
+  events, recorded `fetch`/timers and a two-document fake (parent HA
+  document vs. the page document) with a `localStorage` stand-in —
+  including the background-color deliveries (color with unchanged theme,
+  unparseable candidate falling back to the primary variable), the
+  pre-stream screen rule (exact color, per-theme default, live re-tint of
+  a single style element) and the chrome seed (both values, live switch,
+  unavailable storage).
 
 **Verify.** `node --test "tests/*.test.js"` all green;
 served file check (Step 5) + end-to-end smoke test (Section 6).
@@ -346,7 +384,7 @@ both locations (Section 6).
 - `obsidian/adr/0001-obsidian-ha-theme-sync.md` records the decision, the
   rejected alternatives (runtime sed, `apk`, KasmVNC injection, string-based
   detection) and the consequences.
-- `tests/test_theme_server.py` — 205 Given-When-Then tests covering
+- `tests/test_theme_server.py` — 210 Given-When-Then tests covering
   parsing edge cases, threshold boundaries, vault resolution fall-throughs,
   atomicity, ownership, CLI reload success/failure paths, CLI enablement
   merges, API status codes and idempotency, the remembered-theme state
@@ -408,7 +446,14 @@ on the run script.
    labwc display (`ps` + `WAYLAND_DISPLAY` of that process). After a
    daemon restart the remembered color from
    `/config/.config/ha-theme-sync.json` comes back once the desktop is up.
-7. **Failure modes:**
+7. **Pre-stream screen and dashboard chrome:** open the add-on web UI
+   before any stream starts and confirm the "Waiting for stream" screen is
+   the HA background color (the exact color under ingress, the per-theme
+   default in a standalone tab) instead of black; switching the HA theme
+   live retints it immediately. The sidebar and settings chrome should
+   match the HA luminance from first paint, and the "Connecting…" status
+   bar keeps its translucent dark strip with white text.
+8. **Failure modes:**
    - *404 from HA core on the POST* → the page is not under ingress and the
      endpoint derivation regressed; check `theme-sync.js` endpoint logic.
    - *Permission errors on appearance.json* → the daemon is not running as
@@ -438,3 +483,9 @@ on the run script.
      deferred until one does). A failing paint is reported as
      `background_applied:false` in the API response and never fails the
      theme write.
+   - *The pre-stream screen stays black* → the client's
+     `<style id="ha-theme-sync-style">` rule is not present: check that
+     `GET /theme-sync.js` returns 200 and the dashboard HTML still carries
+     `<script src="./theme-sync.js">` (item 2). If a base-image bump
+     changed the dashboard, the build-time grep assertions should have
+     failed the build — inspect the Dockerfile layer.
