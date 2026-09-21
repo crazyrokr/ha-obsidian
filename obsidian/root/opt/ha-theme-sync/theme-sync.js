@@ -40,15 +40,12 @@
     return rgb;
   }
 
-  function isDark(value) {
-    var rgb = parseColor(value);
-    if (!rgb) return null;
+  function luminance(rgb) {
     var linear = rgb.map(function (channel) {
       var scaled = channel / 255;
       return scaled <= 0.03928 ? scaled / 12.92 : Math.pow((scaled + 0.055) / 1.055, 2.4);
     });
-    var luminance = 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
-    return luminance < 0.5;
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
   }
 
   function toHex(rgb) {
@@ -59,12 +56,14 @@
     return "#" + channels.join("");
   }
 
-  /* The exact HA background color, read from the same variables the theme
-   * decision uses (first parseable candidate wins), normalized to opaque
+  /* {theme, color} of the parent HA window, read in one pass from the same
+   * variables (first parseable candidate wins): the theme is the WCAG
+   * luminance class of that color and the color is normalized to opaque
    * #rrggbb. null when the parent is not accessible or carries no parseable
-   * color — the daemon then falls back to its per-theme default.
+   * color — the caller falls back to the local scheme (no color) and the
+   * daemon then applies its per-theme default background.
    */
-  function parentBackground() {
+  function parentState() {
     try {
       var parentWindow = window.parent;
       if (!parentWindow || parentWindow === window) return null;
@@ -75,26 +74,12 @@
       ];
       for (var i = 0; i < candidates.length; i += 1) {
         var rgb = parseColor(candidates[i]);
-        if (rgb) return toHex(rgb);
-      }
-      return null;
-    } catch (error) {
-      return null;
-    }
-  }
-
-  function parentTheme() {
-    try {
-      var parentWindow = window.parent;
-      if (!parentWindow || parentWindow === window) return null;
-      var styles = parentWindow.getComputedStyle(parentWindow.document.documentElement);
-      var candidates = [
-        styles.getPropertyValue("--clear-background-color"),
-        styles.getPropertyValue("--primary-background-color")
-      ];
-      for (var i = 0; i < candidates.length; i += 1) {
-        var dark = isDark(candidates[i]);
-        if (dark !== null) return dark ? "obsidian" : "moonstone";
+        if (rgb) {
+          return {
+            theme: luminance(rgb) < 0.5 ? "obsidian" : "moonstone",
+            color: toHex(rgb)
+          };
+        }
       }
       return null;
     } catch (error) {
@@ -114,7 +99,9 @@
    * per-theme default instead.
    */
   function currentTheme() {
-    return { theme: parentTheme() || localTheme(), color: parentBackground() };
+    var parent = parentState();
+    if (parent) return parent;
+    return { theme: localTheme(), color: null };
   }
 
   /* The page is served under the ingress path (/api/ingress/<token>) when

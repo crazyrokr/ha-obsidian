@@ -178,12 +178,7 @@ def resolve_vault(
     override = env.get(VAULT_ENV_VAR)
     if override and os.path.isdir(override):
         return override
-    global_config = os.path.join(obsidian_home, ".config", "obsidian", "obsidian.json")
-    try:
-        with open(global_config, encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, ValueError):
-        data = None
+    data = _load_global_config(obsidian_home)
     if isinstance(data, dict):
         newest: tuple[float, str] | None = None
         for entry in (data.get("vaults") or {}).values():
@@ -323,20 +318,17 @@ def handle_set_theme(
     changed = apply_theme(vault, theme, uid, gid)
     store_last_theme(theme, home, background=background)
     background_applied = apply_background(background)
-    if not changed:
-        return {
-            "changed": False,
-            "reloaded": False,
-            "background": background,
-            "background_applied": background_applied,
-        }
-    reload = reloder if reloder is not None else reload_obsidian
-    try:
-        reloaded = bool(reload(env=environment))
-    except Exception:  # noqa: BLE001 - reload is best-effort by contract
-        reloaded = False
+    # A reload is only worth asking for after an actual theme change; when the
+    # value already stands the app is left alone (and the CLI is never invoked).
+    reloaded = False
+    if changed:
+        reload = reloder if reloder is not None else reload_obsidian
+        try:
+            reloaded = bool(reload(env=environment))
+        except Exception:  # noqa: BLE001 - reload is best-effort by contract
+            reloaded = False
     return {
-        "changed": True,
+        "changed": changed,
         "reloaded": reloaded,
         "background": background,
         "background_applied": background_applied,
@@ -365,13 +357,16 @@ def store_last_theme(
     if theme not in VALID_THEMES:
         return
     payload: dict = {"theme": theme}
-    if background is not None:
-        if parse_color(background) is not None:
-            payload["background"] = background
-    elif background is None:
+    if background is None:
+        # No color in this request: keep the previously stored background so a
+        # theme-only request cannot clobber a remembered color.
         stored = _read_state(home).get("background")
         if isinstance(stored, str) and parse_color(stored) is not None:
             payload["background"] = stored
+    elif parse_color(background) is not None:
+        # A provided-but-unparseable color is dropped (theme-only write), so it
+        # never lands in the state file.
+        payload["background"] = background
     path = os.path.join(home, ".config", LAST_THEME_STATE_FILE)
     try:
         os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
