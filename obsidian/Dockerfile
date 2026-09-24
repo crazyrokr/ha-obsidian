@@ -1,4 +1,4 @@
-FROM lscr.io/linuxserver/obsidian:v1.13.7-ls144@sha256:c6c86336a2cf57506b0db2beb09ef4a50170808820a59c20063e669d12122dd4
+FROM lscr.io/linuxserver/obsidian:v1.13.7-ls145@sha256:50c47a0f5223d4f77ced77af501b6b071285da19e4ad6c036fb132326779bbdb
 
 RUN mkdir /share
 COPY root /
