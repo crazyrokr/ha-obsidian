@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-09-06
-- Last updated: 2026-09-21
+- Last updated: 2026-10-27
 - Deciders: maintainers
 
 ## Context
@@ -180,6 +180,28 @@ detects the HA theme and posts it to the daemon through nginx.
     hardcoded rule is version-specific markup that a base-image bump would
     change (and the build-time grep guard would need a second anchor),
     while the one-rule override depends only on CSS cascade order.
+11. **External links open in the viewing browser.** A `xdg-open` PATH
+    overlay (`/usr/local/bin/xdg-open`) forwards a single `http(s)` URL to a
+    dedicated loopback daemon (`127.0.0.1:8091`) and execs the real
+    `/usr/bin/xdg-open` for every other argument or on any failure. The
+    daemon holds a bounded queue (8 items, 30 s TTL, 2 s dedupe) and serves
+    it through a 60 s hanging GET that nginx exposes as GET-only
+    (`limit_except GET { deny all; }`), behind ingress authentication. A
+    dashboard script derives the endpoint from the page location, opens the
+    URL with `window.open`, and falls back to a clickable anchor toast when
+    the browser blocks the popup. Only the in-container wrapper can enqueue
+    a URL; the external surface is read-only. Rejected alternatives: the
+    host-listener/`host.docker.internal` recipe (the add-on manifest has no
+    `extra_hosts`, the HA host is headless, and the client browser is the
+    right target), short polling (wakes continuously), SSE (removes request
+    churn but not idle CPU, and adds streaming and proxy-buffering
+    complexity), WebSocket (an RFC 6455 implementation or a dependency for
+    a one-way channel), extending the theme daemon on 8090 (couples
+    unrelated concerns), and replacing `/usr/bin/xdg-open` in place
+    (fragile distribution edit). `mailto:` is out of scope because Electron
+    uses `xdg-email`. When Obsidian's Web viewer plugin is enabled it
+    intentionally bypasses `xdg-open`; disabling the plugin, or using the
+    link's right-click "Open in default browser", restores forwarding.
 
 ## Consequences
 
@@ -233,3 +255,20 @@ detects the HA theme and posts it to the daemon through nginx.
   the HA theme, the same contract as the vault's `appearance.json`; the
   write is best-effort (private-mode browsers simply keep the app default)
   and it never affects the theme request itself.
+- The image carries one extra long-lived S6 service (`open-url-api`) and one
+  new nginx location. The daemon blocks on a condition variable while idle,
+  so the control channel costs no CPU; its queue is in-memory (8 items,
+  30 s TTL) and is lost on a daemon restart.
+- The link feature adds no runtime dependencies: the daemon, forwarder and
+  client use the Python standard library and plain browser JavaScript.
+- The forwarder runs on every `xdg-open` call. Non-URL arguments and daemon
+  failures fall back to the real binary, so local attachments and the
+  previous behavior are unchanged.
+- `HARDEN_DESKTOP=true` makes the base image `chmod 0000` the resolved
+  `xdg-open`, which disables the feature by design.
+- The feature depends on the Selkies nginx template and the dashboard
+  `</head>` anchor; the Dockerfile's grep guards fail the build if a
+  base-image bump moves them.
+- A queued link is delivered to the first waiting client; the external
+  `GET /api/open-url` surface is read-only and behind Home Assistant
+  authentication under ingress.
