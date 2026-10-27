@@ -28,13 +28,13 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: crazyrokr/gha-workflows/ha-addon-auto-locker@bf06d82937ae7f1dce4cc4d8075be49dfa97da53 # master
+      - uses: crazyrokr/gha-workflows/ha-addon-auto-locker@c03d56f69b5ae10ccfee1afaa56bce98e3a696ae # master
         with:
           branch: ${{ github.event.inputs.branch }}
           lookup_sources: Dockerfile
   run-builder:
     needs: auto-lock
-    uses: crazyrokr/gha-workflows/.github/workflows/ha-addon-cicd.yaml@bf06d82937ae7f1dce4cc4d8075be49dfa97da53 # master
+    uses: crazyrokr/gha-workflows/.github/workflows/ha-addon-cicd.yaml@c03d56f69b5ae10ccfee1afaa56bce98e3a696ae # master
     secrets: inherit
     permissions:
       contents: read
