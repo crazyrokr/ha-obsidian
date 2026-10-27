@@ -44,6 +44,9 @@ existing web UI already runs client-side code inside that browser.
    JavaScript only, matching the existing theme sync.
 6. Full unit coverage for the daemon, the forwarder and the client script;
    the existing suites stay green.
+7. No idle CPU cost: the transport is a hanging GET whose handler blocks on
+   a condition variable; the default recycles at most one request per
+   minute per client and never busy-waits.
 
 ### Non-goals
 
@@ -107,7 +110,7 @@ Obsidian (Electron)
 
 Viewing browser (Selkies dashboard page)
   open-url.js (injected into the dashboard source HTML, classic <script>)
-    -> GET <page-origin><ingress path>/api/open-url?wait=20   (long-poll)
+    -> GET <page-origin><ingress path>/api/open-url?wait=60   (hanging GET)
        -> nginx (new location, GET only)
           -> open_url_server.py (s6 service, loopback 127.0.0.1:8091, as abc)
     -> 200 {"url": "...", "id": N}
@@ -163,6 +166,9 @@ A new, dedicated service on loopback, separate from the theme daemon:
     dropping the oldest item when full; notify waiters.
   - `take(wait_seconds)`: wait on the condition until an item or the
     deadline; pop and return the oldest non-stale item, or `None`.
+  - The 30 s TTL is independent of the 60 s wait: a client already waiting
+    receives an enqueued URL immediately; the TTL only bounds how long an
+    unconsumed URL is kept while no client is waiting.
 - Endpoints:
   - `POST /api/open-url` (loopback only; the wrapper calls it directly):
     JSON body `{"url": "..."}`. `202 {"status": "queued", "id": N}` on
@@ -170,7 +176,7 @@ A new, dedicated service on loopback, separate from the theme daemon:
     malformed, disallowed-scheme, control-character, whitespace or
     over-length URL. Wrong path → 404.
   - `GET /api/open-url?wait=<seconds>` (browser via nginx): `wait` is
-    optional, default 20, clamped to 1..25. `200 {"url": "...", "id": N}`
+    optional, default 60, clamped to 1..60. `200 {"url": "...", "id": N}`
     with `Cache-Control: no-store` when an item is taken; `204` with no body
     on timeout; `429` with `Retry-After: 2` when the number of concurrently
     waiting clients exceeds 4. Wrong path → 404.
@@ -178,6 +184,13 @@ A new, dedicated service on loopback, separate from the theme daemon:
     404, consistent with the theme daemon's API style.
 - No filesystem access, no state persisted across a daemon restart. A
   restart only loses queued links, which is acceptable.
+
+Transport rationale: the long-poll is a hanging GET, not short polling. The
+handler blocks in the condition variable, so an idle client consumes no CPU;
+at the 60 s default it recycles one request per minute. Server-Sent Events
+and WebSockets remove request churn but not idle CPU — both still need a
+heartbeat — and add streaming-protocol and proxy-buffering complexity. The
+60 s maximum wait stays under the 70 s nginx read timeout.
 
 Validation is duplicated in the forwarder and the daemon: the forwarder
 avoids pointless posts and the daemon is the authoritative gate for any
@@ -194,7 +207,7 @@ regeneration source, not the regenerated copy).
   same derivation the theme client uses, correct under ingress and
   standalone access.
 - Long-poll loop:
-  - One in-flight request at a time.
+  - One in-flight `GET ...?wait=60` at a time.
   - `200` → handle the URL, then poll again immediately.
   - `204` → poll again after a short yield.
   - `429` → honor `Retry-After`, then poll again.
@@ -251,6 +264,8 @@ location /open-url.js {
 
 - `limit_except GET` keeps the external surface read-only: only the
   in-container wrapper (loopback, bypassing nginx) can enqueue a URL.
+- `proxy_read_timeout 70s` is deliberately above the 60 s maximum wait so
+  nginx does not cut a legitimate long-poll short.
 - Add the `<script src="./open-url.js"></script>` tag to the source
   `/usr/share/selkies/selkies-dashboard/index.html`, next to the existing
   `theme-sync.js` tag.
@@ -270,7 +285,7 @@ POST /api/open-url          (loopback, from the forwarder)
   -> 400 {"status":"error","error":"unsupported scheme: 'javascript'"}
   -> 404 (other paths)
 
-GET /api/open-url?wait=20   (browser, through nginx; GET only)
+GET /api/open-url?wait=60   (browser, through nginx; GET only)
   -> 200 {"url":"https://example.com/a?b=1","id":7}
   -> 204 (no URL within the wait window)
   -> 429 Retry-After: 2 (more than 4 simultaneous waiters)
@@ -292,7 +307,7 @@ GET /api/open-url?wait=20   (browser, through nginx; GET only)
   Open control uses `rel="noopener noreferrer"`.
 - **Bounded resources.** The queue holds at most 8 items and drops items
   older than 30 s; at most 4 clients can wait concurrently (429 beyond);
-  `wait` is clamped to 25 s.
+  `wait` is clamped to 60 s.
 - **Privacy.** Full URLs are not logged by default; diagnostics log only the
   scheme and host. URLs may contain tokens, and the state is in-memory only.
 - **Failure modes:**
@@ -342,7 +357,8 @@ All tests use Given-When-Then.
   id; ids increase monotonically.
 - HTTP: POST → 202; POST invalid → 400; wrong path → 404; GET takes a queued
   item → 200 JSON; GET timeout → 204; more than four waiters → 429 with
-  `Retry-After`; `wait` clamping; `Cache-Control: no-store`.
+  `Retry-After`; `wait` defaults to 60 and clamps values outside 1..60;
+  `Cache-Control: no-store`.
 - Concurrency: enqueue from another thread wakes a blocked GET; a second
   waiter does not receive the same item.
 
@@ -418,9 +434,17 @@ All tests use Given-When-Then.
   `xdg-open` call omits the URL. Kept only as background context.
 - **Short polling instead of long-poll.** Simpler, but wakes the daemon
   continuously. Both ingress proxies allow requests with no total timeout,
-  so a bounded long-poll is verified viable.
-- **Server-Sent Events.** Viable, but requires streaming through nginx and
-  both proxies; long-poll is plain HTTP and easier to test and bound.
+  so a bounded hanging GET is verified viable and costs no CPU while idle.
+- **Server-Sent Events.** Viable (both proxies stream chunked responses and
+  Home Assistant excludes `text/event-stream` from compression), but it
+  removes request churn, not idle CPU: a heartbeat is still required, and it
+  adds a streaming handler, long-lived threads and proxy-buffering
+  configuration. Plain HTTP long-poll is easier to bound and test; at the
+  60 s default it recycles only one request per minute.
+- **WebSocket.** Proven through ingress by the Selkies stream, but
+  bidirectional and unnecessary here; a standard-library implementation
+  needs RFC 6455 handshake and framing, or a new dependency, for no CPU
+  benefit over a hanging GET.
 - **Extend the theme daemon (port 8090).** Couples two unrelated concerns
   and puts long-poll waiters in the theme process. A separate single-purpose
   service is safer and independently testable.
@@ -445,7 +469,7 @@ All tests use Given-When-Then.
    within the activation window; Safari may not. The toast is the fallback
    in all cases.
 3. **Long-poll through exotic reverse proxies.** A user-provided reverse
-   proxy may have a shorter idle timeout than 20 s; the client retries, and
+   proxy may have a shorter idle timeout than 60 s; the client retries, and
    the queue TTL prevents stale delivery. A smaller `wait` can be chosen
    later without a protocol change.
 4. **Multiple simultaneous viewers.** Consume-once means one viewer gets the
