@@ -1,22 +1,33 @@
-"""URL validation and the pending-link queue for the external-link daemon.
+"""URL validation, the pending-link queue, and the loopback HTTP API.
 
-The loopback HTTP server is added in a later task.
+The daemon accepts links from the xdg-open forwarder on loopback and serves
+them to the dashboard client through a hanging GET.
 """
 
 from __future__ import annotations
 
 import itertools
+import json
+import math
+import os
 import threading
 import time
 from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 ALLOWED_SCHEMES = frozenset({"http", "https"})
 MAX_URL_LENGTH = 8192
 DEFAULT_MAX_ITEMS = 8
 DEFAULT_TTL_SECONDS = 30.0
 DEFAULT_DEDUPE_WINDOW_SECONDS = 2.0
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8091
+DEFAULT_WAIT_SECONDS = 60.0
+MAX_WAIT_SECONDS = 60.0
+MAX_WAITERS = 4
+MAX_BODY_BYTES = 16384
 
 
 def validate_url(value: object) -> str:
@@ -102,3 +113,158 @@ class PendingUrls:
                 if remaining <= 0:
                     return None
                 self._condition.wait(remaining)
+
+
+def clamp_wait(value: str | None) -> float:
+    """Return the requested wait in seconds, clamped to the 1..60 range."""
+    if value is None:
+        return DEFAULT_WAIT_SECONDS
+    try:
+        requested = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_WAIT_SECONDS
+    if not math.isfinite(requested):
+        return DEFAULT_WAIT_SECONDS
+    return max(1.0, min(MAX_WAIT_SECONDS, requested))
+
+
+class WaiterLimiter:
+    """Cap the number of clients holding a hanging GET at once."""
+
+    def __init__(self, limit: int = MAX_WAITERS) -> None:
+        self._limit = limit
+        self._active = 0
+        self._lock = threading.Lock()
+
+    @property
+    def active(self) -> int:
+        with self._lock:
+            return self._active
+
+    def acquire(self) -> bool:
+        with self._lock:
+            if self._active >= self._limit:
+                return False
+            self._active += 1
+            return True
+
+    def release(self) -> None:
+        with self._lock:
+            if self._active > 0:
+                self._active -= 1
+
+
+class OpenUrlRequestHandler(BaseHTTPRequestHandler):
+    server_version = "ha-open-url"
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self) -> None:  # noqa: N802 - http.server API
+        route = urlparse(self.path)
+        if route.path.rstrip("/") != "/api/open-url":
+            self.close_connection = True
+            self._respond_json(404, {"status": "error", "error": "not found"})
+            return
+        length_header = self.headers.get("Content-Length")
+        try:
+            content_length = int(length_header) if length_header is not None else 0
+        except ValueError:
+            self.close_connection = True
+            self._respond_json(400, {"status": "error", "error": "invalid Content-Length"})
+            return
+        if content_length <= 0 or content_length > MAX_BODY_BYTES:
+            self.close_connection = True
+            self._respond_json(400, {"status": "error", "error": "invalid body size"})
+            return
+        try:
+            payload = json.loads(self.rfile.read(content_length))
+        except (ValueError, UnicodeDecodeError):
+            self._respond_json(400, {"status": "error", "error": "malformed JSON"})
+            return
+        if not isinstance(payload, dict):
+            self._respond_json(400, {"status": "error", "error": "body must be an object"})
+            return
+        try:
+            url = validate_url(payload.get("url"))
+        except ValueError as error:
+            self._respond_json(400, {"status": "error", "error": str(error)})
+            return
+        item_id = self.server.pending.enqueue(url)
+        self._respond_json(202, {"status": "queued", "id": item_id})
+
+    def do_GET(self) -> None:  # noqa: N802 - http.server API
+        route = urlparse(self.path)
+        if route.path.rstrip("/") != "/api/open-url":
+            self._respond_json(404, {"status": "error", "error": "not found"})
+            return
+        wait = clamp_wait(parse_qs(route.query).get("wait", [None])[0])
+        if not self.server.limiter.acquire():
+            self._respond_json(
+                429,
+                {"status": "error", "error": "too many waiters"},
+                {"Retry-After": "2"},
+            )
+            return
+        try:
+            item = self.server.pending.take(wait)
+        finally:
+            self.server.limiter.release()
+        if item is None:
+            self._respond_no_content()
+            return
+        item_id, url = item
+        self._respond_json(200, {"url": url, "id": item_id})
+
+    def _respond_json(
+        self, code: int, payload: dict, headers: dict[str, str] | None = None
+    ) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _respond_no_content(self) -> None:
+        self.send_response(204)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+
+class OpenUrlServer(ThreadingHTTPServer):
+    """A threaded loopback server carrying the pending queue and waiter cap."""
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        pending: PendingUrls | None = None,
+    ) -> None:
+        super().__init__(server_address, OpenUrlRequestHandler)
+        self.pending = pending if pending is not None else PendingUrls()
+        self.limiter = WaiterLimiter()
+
+
+def make_server(
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    pending: PendingUrls | None = None,
+) -> OpenUrlServer:
+    """Create the loopback server; tests pass port 0 for an ephemeral port."""
+    return OpenUrlServer((host, port), pending=pending)
+
+
+def main() -> None:
+    host = os.environ.get("OPEN_URL_HOST", DEFAULT_HOST)
+    port = int(os.environ.get("OPEN_URL_PORT", str(DEFAULT_PORT)))
+    server = make_server(host, port)
+    print(f"[ha-open-url] listening on {host}:{port}", flush=True)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

@@ -5,8 +5,11 @@ Every test follows the Given-When-Then structure.
 
 from __future__ import annotations
 
+import http.client
+import json
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -217,3 +220,209 @@ def test_two_waiters_do_not_receive_the_same_item() -> None:
     # Then exactly one waiter received it
     assert len(results) == 2
     assert sum(result is not None for result in results) == 1
+
+
+# --------------------------------------------------------------------------
+# HTTP API
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def server():
+    server = ts.make_server("127.0.0.1", 0)
+    thread = threading.Thread(target=lambda: server.serve_forever(0.01), daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
+
+def _request(server, method, path, body=None, headers=None):
+    connection = http.client.HTTPConnection(
+        "127.0.0.1", server.server_address[1], timeout=5
+    )
+    try:
+        connection.request(method, path, body=body, headers=headers or {})
+        response = connection.getresponse()
+        return response.status, dict(response.getheaders()), response.read()
+    finally:
+        connection.close()
+
+
+def _post_json(server, path, payload):
+    return _request(
+        server,
+        "POST",
+        path,
+        body=json.dumps(payload),
+        headers={"Content-Type": "application/json"},
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, 60.0),
+        ("30", 30.0),
+        ("0", 1.0),
+        ("-5", 1.0),
+        ("999", 60.0),
+        ("abc", 60.0),
+        ("nan", 60.0),
+        ("inf", 60.0),
+    ],
+)
+def test_clamp_wait(value: str | None, expected: float) -> None:
+    # Given a raw wait value
+    # When clamped
+    result = ts.clamp_wait(value)
+    # Then the default or the [1, 60] bound is returned
+    assert result == expected
+
+
+def test_limiter_caps_concurrent_waiters() -> None:
+    # Given a limiter with four slots
+    limiter = ts.WaiterLimiter(4)
+    # When four slots are taken
+    assert [limiter.acquire() for _ in range(4)] == [True, True, True, True]
+    # Then the fifth is refused
+    assert limiter.acquire() is False
+    # And releasing one allows the next
+    limiter.release()
+    assert limiter.acquire() is True
+    assert limiter.active == 4
+
+
+def test_post_queues_url(server) -> None:
+    # Given a running daemon
+    # When a valid URL is posted
+    status, headers, body = _post_json(
+        server, "/api/open-url", {"url": "https://example.com/a"}
+    )
+    payload = json.loads(body)
+    # Then it is queued and the response is 202
+    assert status == 202
+    assert payload["status"] == "queued"
+    assert headers["Cache-Control"] == "no-store"
+    # And the queue holds it
+    assert server.pending.take(0) == (payload["id"], "https://example.com/a")
+
+
+def test_post_rejects_invalid_scheme(server) -> None:
+    # Given a running daemon
+    # When a disallowed-scheme URL is posted
+    status, _, body = _post_json(
+        server, "/api/open-url", {"url": "javascript:alert(1)"}
+    )
+    # Then it is rejected and nothing is queued
+    assert status == 400
+    assert json.loads(body)["status"] == "error"
+    assert len(server.pending) == 0
+
+
+def test_post_rejects_malformed_json(server) -> None:
+    # Given a running daemon
+    # When the body is not JSON
+    status, _, _ = _request(
+        server,
+        "POST",
+        "/api/open-url",
+        body="{",
+        headers={"Content-Type": "application/json"},
+    )
+    # Then the request is rejected
+    assert status == 400
+
+
+def test_post_rejects_missing_url(server) -> None:
+    # Given a running daemon
+    # When the JSON object has no url
+    status, _, _ = _post_json(server, "/api/open-url", {"other": 1})
+    # Then the request is rejected
+    assert status == 400
+
+
+def test_post_rejects_oversized_body(server) -> None:
+    # Given a running daemon
+    # When the body exceeds the limit
+    status, _, _ = _post_json(
+        server,
+        "/api/open-url",
+        {"url": "https://example.com/" + "a" * ts.MAX_BODY_BYTES},
+    )
+    # Then the request is rejected
+    assert status == 400
+
+
+def test_post_unknown_path_is_404(server) -> None:
+    # Given a running daemon
+    # When a URL is posted to another path
+    status, _, _ = _post_json(server, "/api/other", {"url": "https://example.com"})
+    # Then it is not found
+    assert status == 404
+
+
+def test_get_returns_a_queued_url(server) -> None:
+    # Given a queued URL
+    _, _, body = _post_json(server, "/api/open-url", {"url": "https://example.com/a"})
+    item_id = json.loads(body)["id"]
+    # When a client asks for the next URL
+    status, headers, body = _request(server, "GET", "/api/open-url?wait=1")
+    # Then it is returned with no-store
+    assert status == 200
+    assert json.loads(body) == {"url": "https://example.com/a", "id": item_id}
+    assert headers["Cache-Control"] == "no-store"
+
+
+def test_get_times_out_with_204(server) -> None:
+    # Given an empty queue
+    # When a client waits for a URL
+    status, headers, body = _request(server, "GET", "/api/open-url?wait=1")
+    # Then the wait ends with an empty response
+    assert status == 204
+    assert body == b""
+    assert "Content-Type" not in headers
+
+
+def test_get_returns_429_when_all_waiter_slots_are_taken(server) -> None:
+    # Given every waiter slot is taken
+    for _ in range(ts.MAX_WAITERS):
+        assert server.limiter.acquire()
+    try:
+        # When a client polls
+        status, headers, _ = _request(server, "GET", "/api/open-url?wait=1")
+        # Then it is refused with Retry-After
+        assert status == 429
+        assert headers["Retry-After"] == "2"
+    finally:
+        for _ in range(ts.MAX_WAITERS):
+            server.limiter.release()
+
+
+def test_get_unknown_path_is_404(server) -> None:
+    # Given a running daemon
+    # When a client polls another path
+    status, _, _ = _request(server, "GET", "/api/other?wait=1")
+    # Then it is not found
+    assert status == 404
+
+
+def test_enqueue_wakes_a_blocked_get(server) -> None:
+    # Given a client polling with a two-second wait
+    responses: list[tuple[int, bytes]] = []
+
+    def poll() -> None:
+        status, _, body = _request(server, "GET", "/api/open-url?wait=2")
+        responses.append((status, body))
+
+    thread = threading.Thread(target=poll)
+    thread.start()
+    time.sleep(0.1)
+    # When a URL is posted
+    _post_json(server, "/api/open-url", {"url": "https://example.com/wake"})
+    thread.join(timeout=3.0)
+    # Then the waiting client receives it
+    assert responses and responses[0][0] == 200
+    assert json.loads(responses[0][1])["url"] == "https://example.com/wake"
