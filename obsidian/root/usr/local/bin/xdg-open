@@ -1,0 +1,5 @@
+#!/bin/sh
+# Runs the forwarder from this script's directory so the same path works in
+# the image (/usr/local/bin -> /opt) and in the repository.
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec /usr/bin/python3 "$SELF_DIR/../../../opt/ha-open-url/forwarder.py" "$@"
