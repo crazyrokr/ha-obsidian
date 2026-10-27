@@ -40,8 +40,9 @@ Viewing browser (Selkies dashboard page)
     -> 204 / 429 / error: re-poll or back off
 ```
 
-The hanging GET blocks on a condition variable, so an idle client costs no
-CPU; the default recycles one request per minute. A real push transport
+The hanging GET blocks on a condition variable and wakes in 0.5 s slices to
+notice a disconnected client; the idle cost is a non-blocking select twice a
+second, and the default recycles one request per minute. A real push transport
 (SSE or WebSocket) would remove request churn but not idle CPU and would add
 streaming-protocol and proxy-buffering complexity.
 
@@ -97,8 +98,9 @@ GET /api/open-url?wait=60   (browser, through nginx; GET only)
   rejected with 400 and never reach the browser.
 - The queue holds at most 8 items, drops items older than 30 s, and
   collapses repeats of the same URL within 2 s. A URL is delivered to the
-  first waiting client; the state is in-memory and is lost on a daemon
-  restart.
+  first live waiting client; a client that disconnects is detected within
+  0.5 s, releases its slot and does not consume the URL. The state is
+  in-memory and is lost on a daemon restart.
 - `wait` defaults to 60 s and is clamped to 1..60 s. nginx uses a 70 s read
   timeout, deliberately above the maximum wait.
 - The external nginx surface is GET-only (`limit_except GET { deny all; }`);
@@ -146,8 +148,8 @@ viewed from any device.
 - **Multiple viewers.** A queued link is consumed by the first waiting
   client. The add-on normally has one viewer.
 - **A user-provided reverse proxy with a short idle timeout.** The 60 s
-  hanging GET may be cut; the client retries and the 30 s TTL prevents stale
-  delivery. The wait can be lowered later without a protocol change.
+  hanging GET may be cut; the client retries and the 30 s TTL bounds
+  unconsumed URLs. The wait can be lowered later without a protocol change.
 
 ## 7. Verification checklist
 

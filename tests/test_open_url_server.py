@@ -426,3 +426,21 @@ def test_enqueue_wakes_a_blocked_get(server) -> None:
     # Then the waiting client receives it
     assert responses and responses[0][0] == 200
     assert json.loads(responses[0][1])["url"] == "https://example.com/wake"
+
+
+def test_aborted_get_does_not_consume_a_later_url(server) -> None:
+    # Given a GET whose client disconnects while it waits
+    connection = http.client.HTTPConnection(
+        "127.0.0.1", server.server_address[1], timeout=5
+    )
+    connection.request("GET", "/api/open-url?wait=5")
+    time.sleep(0.1)
+    connection.close()
+    # When a URL is posted
+    _post_json(server, "/api/open-url", {"url": "https://example.com/keep"})
+    time.sleep(1.0)
+    # Then the aborted waiter released its slot and left the URL queued
+    assert server.limiter.active == 0
+    status, _, body = _request(server, "GET", "/api/open-url?wait=1")
+    assert status == 200
+    assert json.loads(body)["url"] == "https://example.com/keep"

@@ -10,6 +10,8 @@ import itertools
 import json
 import math
 import os
+import select
+import socket
 import threading
 import time
 from collections import deque
@@ -60,9 +62,10 @@ class PendingUrls:
 
     The queue holds at most `max_items` URLs, drops items older than `ttl`,
     and collapses repeats of the same URL within `dedupe_window`. `take`
-    blocks on a condition variable, so an idle client costs no CPU. The
-    injectable clock drives the TTL and dedupe decisions; the blocking wait
-    always uses the monotonic clock.
+    blocks on a condition variable in short slices and checks an optional
+    disconnect predicate before consuming, so an aborted request never
+    steals a queued link. The injectable clock drives the TTL and dedupe
+    decisions; the blocking wait always uses the monotonic clock.
     """
 
     def __init__(
@@ -100,19 +103,26 @@ class PendingUrls:
             self._condition.notify_all()
             return item_id
 
-    def take(self, wait_seconds: float) -> tuple[int, str] | None:
+    def take(
+        self,
+        wait_seconds: float,
+        is_disconnected: Callable[[], bool] | None = None,
+        slice_seconds: float = 0.5,
+    ) -> tuple[int, str] | None:
         deadline = time.monotonic() + wait_seconds
         with self._condition:
             while True:
                 now = self._clock()
                 self._drop_stale_locked(now)
+                if is_disconnected is not None and is_disconnected():
+                    return None
                 if self._items:
                     item_id, url, _ = self._items.popleft()
                     return item_id, url
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None
-                self._condition.wait(remaining)
+                self._condition.wait(min(remaining, slice_seconds))
 
 
 def clamp_wait(value: str | None) -> float:
@@ -126,6 +136,22 @@ def clamp_wait(value: str | None) -> float:
     if not math.isfinite(requested):
         return DEFAULT_WAIT_SECONDS
     return max(1.0, min(MAX_WAIT_SECONDS, requested))
+
+
+def peer_disconnected(connection: socket.socket) -> bool:
+    """True when a waiting client has closed its end of the connection."""
+    try:
+        readable, _, _ = select.select([connection], [], [], 0)
+    except (OSError, ValueError):
+        return True
+    if not readable:
+        return False
+    try:
+        return connection.recv(1, socket.MSG_PEEK) == b""
+    except (BlockingIOError, InterruptedError):
+        return False
+    except OSError:
+        return True
 
 
 class WaiterLimiter:
@@ -204,10 +230,22 @@ class OpenUrlRequestHandler(BaseHTTPRequestHandler):
                 {"Retry-After": "2"},
             )
             return
+        aborted = False
+
+        def disconnected() -> bool:
+            nonlocal aborted
+            if peer_disconnected(self.connection):
+                aborted = True
+                return True
+            return False
+
         try:
-            item = self.server.pending.take(wait)
+            item = self.server.pending.take(wait, disconnected)
         finally:
             self.server.limiter.release()
+        if aborted:
+            self.close_connection = True
+            return
         if item is None:
             self._respond_no_content()
             return

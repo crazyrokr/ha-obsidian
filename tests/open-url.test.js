@@ -455,8 +455,8 @@ test("hidden document pauses polling", async () => {
   assert.equal(browser.fetchCalls.length, before + 1);
 });
 
-test("duplicate id is ignored", async () => {
-  // Given two responses with the same id
+test("a reused id after a daemon restart still opens", async () => {
+  // Given the daemon restarted and reused id 7 for a new URL
   const browser = createBrowser({
     behaviors: [
       () => Promise.resolve(jsonResponse({ url: "https://example.com/a", id: 7 })),
@@ -467,10 +467,11 @@ test("duplicate id is ignored", async () => {
   await browser.tick();
   // Then the first opens
   assert.equal(browser.openCalls.length, 1);
-  // And the duplicate is ignored
+  // And the reused id does not suppress the new URL
   browser.runTimeouts();
   await browser.tick();
-  assert.equal(browser.openCalls.length, 1);
+  assert.equal(browser.openCalls.length, 2);
+  assert.equal(browser.openCalls[1].url, "https://example.com/b");
 });
 
 test("copy uses the clipboard and degrades", async () => {

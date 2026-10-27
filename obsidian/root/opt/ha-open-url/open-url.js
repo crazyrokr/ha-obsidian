@@ -34,7 +34,6 @@
     "border-radius:6px;border:1px solid currentColor;background:transparent;" +
     "color:inherit;text-decoration:none;cursor:pointer}";
 
-  var lastId = null;
   var polling = false;
   var retryIndex = 0;
   var timer = null;
@@ -88,7 +87,7 @@
     }
     return response.json().then(function (payload) {
       retryIndex = 0;
-      handleUrl(payload && payload.url, payload && payload.id);
+      handleUrl(payload && payload.url);
       schedule(0);
     });
   }
@@ -109,9 +108,7 @@
       });
   }
 
-  function handleUrl(raw, id) {
-    if (id !== null && id !== undefined && id === lastId) return;
-    if (id !== null && id !== undefined) lastId = id;
+  function handleUrl(raw) {
     var url;
     try {
       url = new URL(raw);

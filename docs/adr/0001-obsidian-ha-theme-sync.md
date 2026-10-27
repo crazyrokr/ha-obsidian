@@ -256,8 +256,10 @@ detects the HA theme and posts it to the daemon through nginx.
   write is best-effort (private-mode browsers simply keep the app default)
   and it never affects the theme request itself.
 - The image carries one extra long-lived S6 service (`open-url-api`) and one
-  new nginx location. The daemon blocks on a condition variable while idle,
-  so the control channel costs no CPU; its queue is in-memory (8 items,
+  new nginx location. The daemon blocks on a condition variable and wakes in
+  0.5 s slices to detect a disconnected client, so the idle cost is a
+  non-blocking select twice a second; an aborted long-poll releases its slot
+  and does not consume a queued link. Its queue is in-memory (8 items,
   30 s TTL) and is lost on a daemon restart.
 - The link feature adds no runtime dependencies: the daemon, forwarder and
   client use the Python standard library and plain browser JavaScript.
@@ -269,6 +271,6 @@ detects the HA theme and posts it to the daemon through nginx.
 - The feature depends on the Selkies nginx template and the dashboard
   `</head>` anchor; the Dockerfile's grep guards fail the build if a
   base-image bump moves them.
-- A queued link is delivered to the first waiting client; the external
+- A queued link is delivered to the first live waiting client; the external
   `GET /api/open-url` surface is read-only and behind Home Assistant
   authentication under ingress.

@@ -235,6 +235,7 @@ Use a pytest fixture that calls `make_server("127.0.0.1", 0)`, starts
 | `test_get_returns_429_when_all_waiter_slots_are_taken` | acquire 4 slots; GET → 429 with `Retry-After: 2` |
 | `test_get_unknown_path_is_404` | 404 |
 | `test_enqueue_wakes_a_blocked_get` | GET with `?wait=2` in a thread; POST after 0.1 s; GET returns 200 |
+| `test_aborted_get_does_not_consume_a_later_url` | close a waiting GET; POST; the slot is released and a live GET still receives the URL |
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -249,8 +250,10 @@ returning `[1.0, 60.0]`. `WaiterLimiter` is a lock plus a counter.
 `/api/open-url` (trailing slash tolerated); every other path is 404. `POST`
 reads at most `MAX_BODY_BYTES`, parses JSON, requires an object with a string
 `url`, calls `validate_url`, enqueues, and returns 202. `GET` clamps `wait`,
-takes a limiter slot (non-blocking) or returns 429, calls `pending.take`, and
-returns 200 JSON or 204. JSON responses set `Content-Type: application/json`,
+takes a limiter slot (non-blocking) or returns 429, calls `pending.take` with
+a disconnect predicate, and returns 200 JSON or 204. An aborted request
+returns without consuming a URL and releases its slot. JSON responses set
+`Content-Type: application/json`,
 `Content-Length`, and `Cache-Control: no-store`; 204 sends no body and no
 `Content-Type`. `main()` reads `OPEN_URL_HOST`/`OPEN_URL_PORT`, prints
 `[ha-open-url] listening on <host>:<port>`, and serves forever.
@@ -395,7 +398,7 @@ Tests (all with `// Given`, `// When`, `// Then`):
 | `test_429_honors_retry_after` | next timeout delay is 2000 ms |
 | `test_error_backoff_and_reset` | 500 → 1000, 2000, 5000, 5000 ms; a later 200 resets to 1000 |
 | `test_hidden_document_pauses` | no new fetch while `hidden`; visible event starts one |
-| `test_duplicate_id_is_ignored` | the same `id` twice opens once |
+| `test_repeated_id_after_restart_still_opens` | the same `id` twice opens twice (ids reset with the daemon) |
 | `test_copy_uses_clipboard_and_degrades` | `writeText(url)` called; absent clipboard does not throw |
 | `test_dismiss_removes_the_toast` | `getElementById(TOAST_ID)` is null after dismiss |
 | `test_theme_dark_and_light` | `data-theme` follows `localStorage["theme"]`, then `prefers-color-scheme` |

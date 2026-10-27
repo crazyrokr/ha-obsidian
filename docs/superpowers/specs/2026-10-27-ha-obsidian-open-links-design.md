@@ -45,8 +45,9 @@ existing web UI already runs client-side code inside that browser.
 6. Full unit coverage for the daemon, the forwarder and the client script;
    the existing suites stay green.
 7. No idle CPU cost: the transport is a hanging GET whose handler blocks on
-   a condition variable; the default recycles at most one request per
-   minute per client and never busy-waits.
+   a condition variable and wakes in 0.5 s slices only to detect a
+   disconnected client; the default recycles at most one request per minute
+   per client and never busy-waits.
 
 ### Non-goals
 
@@ -164,8 +165,9 @@ A new, dedicated service on loopback, separate from the theme daemon:
   - `enqueue(url)`: drop stale items (older than 30 s); if the same URL was
     enqueued within the last 2 s, return the existing id; otherwise append,
     dropping the oldest item when full; notify waiters.
-  - `take(wait_seconds)`: wait on the condition until an item or the
-    deadline; pop and return the oldest non-stale item, or `None`.
+  - `take(wait_seconds, is_disconnected=None)`: wait on the condition in
+    0.5 s slices; check the disconnect predicate before consuming; pop and
+    return the oldest non-stale item for a live client, or `None`.
   - The 30 s TTL is independent of the 60 s wait: a client already waiting
     receives an enqueued URL immediately; the TTL only bounds how long an
     unconsumed URL is kept while no client is waiting.
@@ -186,8 +188,10 @@ A new, dedicated service on loopback, separate from the theme daemon:
   restart only loses queued links, which is acceptable.
 
 Transport rationale: the long-poll is a hanging GET, not short polling. The
-handler blocks in the condition variable, so an idle client consumes no CPU;
-at the 60 s default it recycles one request per minute. Server-Sent Events
+handler blocks in the condition variable and wakes in 0.5 s slices to check
+whether the client is still connected; the idle cost is a non-blocking
+select twice a second. At the 60 s default it recycles one request per
+minute. Server-Sent Events
 and WebSockets remove request churn but not idle CPU — both still need a
 heartbeat — and add streaming-protocol and proxy-buffering complexity. The
 60 s maximum wait stays under the 70 s nginx read timeout.
@@ -313,6 +317,9 @@ GET /api/open-url?wait=60   (browser, through nginx; GET only)
 - **Failure modes:**
   - Daemon unavailable → forwarder execs the real `xdg-open`, so the link
     opens in the container as before.
+  - A browser tab is closed or reloaded → the daemon detects the closed
+    socket within 0.5 s, releases the waiter slot and leaves any queued URL
+    for a live client.
   - No browser client connected → the URL waits up to 30 s, then is dropped.
     The common case has a long-poll already in flight because the dashboard
     is visible.
@@ -385,8 +392,9 @@ All tests use Given-When-Then.
 - `204` → immediate re-poll; `429` → honors `Retry-After`; network error →
   capped backoff; success resets backoff.
 - Hidden document → no poll; visible again → poll resumes.
-- Duplicate id → no second toast/open; a second URL replaces the existing
-  toast content.
+- A repeated id after a daemon restart still opens (ids reset with the
+  process and the client does not dedupe by id); a second URL replaces the
+  existing toast content.
 - **Copy** writes the URL through `navigator.clipboard` and degrades
   silently when clipboard access is unavailable.
 - Dark/light theme from `localStorage` and the `prefers-color-scheme`
