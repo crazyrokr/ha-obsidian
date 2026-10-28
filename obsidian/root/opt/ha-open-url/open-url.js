@@ -11,6 +11,19 @@
   var TOAST_ID = "ha-open-url-toast";
   var STYLE_ID = "ha-open-url-style";
   var DEFAULT_RETRY_AFTER_SECONDS = 2;
+  var WEB_SCHEMES = { "http:": true, "https:": true };
+  var ALLOWED_SCHEMES = {
+    "http:": true,
+    "https:": true,
+    "mailto:": true,
+    "tel:": true,
+    "sms:": true
+  };
+  var TOAST_TITLES = {
+    "mailto:": "Open this email?",
+    "tel:": "Call this number?",
+    "sms:": "Send this message?"
+  };
 
   /* The page is served under the ingress path when embedded, so the endpoint
    * is derived from the page location rather than hardcoded.
@@ -115,20 +128,22 @@
     } catch (error) {
       return;
     }
-    if (url.protocol !== "http:" && url.protocol !== "https:") return;
-    var opened = null;
-    try {
-      opened = window.open(url.href, "_blank");
-    } catch (error) {
-      opened = null;
-    }
-    if (opened) {
+    if (!ALLOWED_SCHEMES[url.protocol]) return;
+    if (WEB_SCHEMES[url.protocol]) {
+      var opened = null;
       try {
-        opened.opener = null;
+        opened = window.open(url.href, "_blank");
       } catch (error) {
-        /* The handle may be read-only in some browsers. */
+        opened = null;
       }
-      return;
+      if (opened) {
+        try {
+          opened.opener = null;
+        } catch (error) {
+          /* The handle may be read-only in some browsers. */
+        }
+        return;
+      }
     }
     showToast(url.href);
   }
@@ -164,6 +179,15 @@
     if (toast && toast.parentNode) toast.parentNode.removeChild(toast);
   }
 
+  function targetLabel(parsed) {
+    var label = parsed.pathname || parsed.href;
+    try {
+      return decodeURIComponent(label);
+    } catch (error) {
+      return label;
+    }
+  }
+
   function showToast(url) {
     var doc = window.document;
     if (!doc.body) {
@@ -191,15 +215,19 @@
     toast.setAttribute("data-theme", toastTheme());
     doc.body.appendChild(toast);
 
+    var parsed = new URL(url);
+    var isWeb = WEB_SCHEMES[parsed.protocol];
+
     var title = doc.createElement("div");
     title.className = "ha-open-url-title";
-    title.textContent = "Open link in your browser?";
+    title.textContent = isWeb
+      ? "Open link in your browser?"
+      : TOAST_TITLES[parsed.protocol] || "Open this link?";
     toast.appendChild(title);
 
-    var parsed = new URL(url);
     var host = doc.createElement("div");
     host.className = "ha-open-url-host";
-    host.textContent = parsed.host;
+    host.textContent = isWeb ? parsed.host : targetLabel(parsed);
     host.setAttribute("title", url);
     toast.appendChild(host);
 
@@ -210,8 +238,10 @@
     open.className = "ha-open-url-open";
     open.textContent = "Open";
     open.setAttribute("href", url);
-    open.setAttribute("target", "_blank");
-    open.setAttribute("rel", "noopener noreferrer");
+    if (isWeb) {
+      open.setAttribute("target", "_blank");
+      open.setAttribute("rel", "noopener noreferrer");
+    }
     open.addEventListener("click", removeToast);
     actions.appendChild(open);
 

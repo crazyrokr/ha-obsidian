@@ -19,7 +19,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
 from urllib.parse import parse_qs, urlparse, urlsplit
 
-ALLOWED_SCHEMES = frozenset({"http", "https"})
+ALLOWED_SCHEMES = frozenset({"http", "https", "mailto", "tel", "sms"})
+HOST_SCHEMES = frozenset({"http", "https"})
+NUMBER_SCHEMES = frozenset({"tel", "sms"})
+ENCODED_CONTROL_MARKERS = ("%00", "%0a", "%0d")
 MAX_URL_LENGTH = 8192
 DEFAULT_MAX_ITEMS = 8
 DEFAULT_TTL_SECONDS = 30.0
@@ -33,11 +36,13 @@ MAX_BODY_BYTES = 16384
 
 
 def validate_url(value: object) -> str:
-    """Return the original URL, or raise ValueError when it is not allowed.
+    """Return the original link, or raise ValueError when it is not allowed.
 
-    Only absolute http(s) URLs with a host are accepted. Whitespace and
-    control characters are rejected so a link cannot smuggle a second
-    argument or a log-breaking line into the diagnostic path.
+    http(s) need a host; mailto needs a recipient; tel and sms need a
+    number. Whitespace and control characters are rejected so a link cannot
+    smuggle a second argument or a log-breaking line into the diagnostic
+    path, and encoded CR/LF/NUL are rejected for the schemes whose payload
+    can become mail headers or message text.
     """
     if not isinstance(value, str):
         raise ValueError(f"URL must be a string, got {type(value).__name__}")
@@ -50,10 +55,19 @@ def validate_url(value: object) -> str:
         parsed = urlsplit(value)
     except ValueError as error:
         raise ValueError(f"malformed URL: {error}") from None
-    if parsed.scheme.lower() not in ALLOWED_SCHEMES:
+    scheme = parsed.scheme.lower()
+    if scheme not in ALLOWED_SCHEMES:
         raise ValueError(f"unsupported scheme: {parsed.scheme!r}")
-    if not parsed.netloc:
+    if scheme in HOST_SCHEMES and not parsed.netloc:
         raise ValueError("URL must include a host")
+    if scheme == "mailto" and not (parsed.netloc or parsed.path or parsed.query):
+        raise ValueError("URL must include a recipient")
+    if scheme in NUMBER_SCHEMES and not parsed.path:
+        raise ValueError("URL must include a number")
+    if scheme in {"mailto", "tel", "sms"}:
+        lowered = value.lower()
+        if any(marker in lowered for marker in ENCODED_CONTROL_MARKERS):
+            raise ValueError("URL must not contain encoded control characters")
     return value
 
 

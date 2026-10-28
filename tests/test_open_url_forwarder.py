@@ -18,6 +18,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 MODULE_DIR = ROOT / "obsidian" / "root" / "opt" / "ha-open-url"
 LAUNCHER = ROOT / "obsidian" / "root" / "usr" / "local" / "bin" / "xdg-open"
+EMAIL_LAUNCHER = ROOT / "obsidian" / "root" / "usr" / "local" / "bin" / "xdg-email"
 sys.path.insert(0, str(MODULE_DIR))
 
 import forwarder  # noqa: E402
@@ -93,7 +94,13 @@ def _write_real_stub(tmp_path: Path) -> Path:
         (["HTTPS://EXAMPLE.COM"], True),
         (["file:///etc/passwd"], False),
         (["javascript:alert(1)"], False),
-        (["mailto:a@b.c"], False),
+        (["mailto:a@b.c"], True),
+        (["mailto:?subject=Hi"], True),
+        (["mailto:"], False),
+        (["tel:+15551234567"], True),
+        (["tel:"], False),
+        (["sms:+15551234567?body=Hi"], True),
+        (["sms:"], False),
         (["/config/a.pdf"], False),
         ([], False),
         (["https://a", "https://b"], False),
@@ -181,6 +188,83 @@ def test_main_falls_back_when_the_obsidian_launcher_fails(monkeypatch) -> None:
     ]
 
 
+def test_main_email_mode_uses_the_email_fallback(monkeypatch) -> None:
+    # Given a mail link and an unreachable daemon in email mode
+    calls: list[tuple[list[str], str]] = []
+
+    def fake_real(argv: list[str], real: str) -> None:
+        calls.append((list(argv), real))
+        raise SystemExit(0)
+
+    monkeypatch.setattr(forwarder, "exec_real", fake_real)
+    monkeypatch.setenv("OPEN_URL_MODE", "email")
+    monkeypatch.setenv("XDG_EMAIL_REAL", "/usr/bin/xdg-email-stub")
+    monkeypatch.setenv("OPEN_URL_ENDPOINT", "http://127.0.0.1:1/api/open-url")
+    with pytest.raises(SystemExit):
+        # When the email forwarder runs
+        forwarder.main(["mailto:a@example.com"])
+    # Then it falls back to the real xdg-email, not xdg-open
+    assert calls == [(["mailto:a@example.com"], "/usr/bin/xdg-email-stub")]
+
+
+def test_main_email_mode_falls_back_for_options(monkeypatch) -> None:
+    # Given another tool calling xdg-email with options instead of a URI
+    calls: list[tuple[list[str], str]] = []
+
+    def fake_real(argv: list[str], real: str) -> None:
+        calls.append((list(argv), real))
+        raise SystemExit(0)
+
+    monkeypatch.setattr(forwarder, "exec_real", fake_real)
+    monkeypatch.setenv("OPEN_URL_MODE", "email")
+    monkeypatch.setenv("XDG_EMAIL_REAL", "/usr/bin/xdg-email-stub")
+    with pytest.raises(SystemExit):
+        # When the email forwarder runs
+        forwarder.main(["--subject", "Hi", "--body", "There"])
+    # Then every option reaches the real binary unchanged
+    assert calls == [
+        (["--subject", "Hi", "--body", "There"], "/usr/bin/xdg-email-stub")
+    ]
+
+
+def test_main_email_mode_does_not_launch_the_obsidian_app(monkeypatch) -> None:
+    # Given an obsidian URI arriving through xdg-email
+    calls: list[tuple[list[str], str]] = []
+
+    def fail(*args, **kwargs):
+        raise AssertionError("the app must not be launched from xdg-email")
+
+    def fake_real(argv: list[str], real: str) -> None:
+        calls.append((list(argv), real))
+        raise SystemExit(0)
+
+    monkeypatch.setattr(forwarder, "exec_app", fail)
+    monkeypatch.setattr(forwarder, "exec_real", fake_real)
+    monkeypatch.setenv("OPEN_URL_MODE", "email")
+    monkeypatch.setenv("XDG_EMAIL_REAL", "/usr/bin/xdg-email-stub")
+    with pytest.raises(SystemExit):
+        # When the email forwarder runs
+        forwarder.main(["obsidian://open?vault=main"])
+    # Then it keeps the unchanged xdg-email fallback
+    assert calls == [(["obsidian://open?vault=main"], "/usr/bin/xdg-email-stub")]
+
+
+def test_mailto_diagnostics_do_not_include_the_recipient(monkeypatch, capsys) -> None:
+    # Given a mail link with a private recipient and subject
+
+    def fake_send(url: str, endpoint: str | None = None, timeout: float | None = None):
+        return None
+
+    monkeypatch.setattr(forwarder, "send", fake_send)
+    # When the forwarder runs
+    forwarder.main(["mailto:secret@example.com?subject=private"])
+    # Then only the scheme is logged
+    stderr = capsys.readouterr().err
+    assert "scheme=mailto" in stderr
+    assert "secret@example.com" not in stderr
+    assert "private" not in stderr
+
+
 def test_obsidian_diagnostics_do_not_include_the_full_uri(monkeypatch, capsys) -> None:
     # Given a deep link carrying a private vault and file name
 
@@ -207,9 +291,10 @@ def test_obsidian_diagnostics_do_not_include_the_full_uri(monkeypatch, capsys) -
         (["obsidian://show-plugin?id=obsidian-importer"], "app"),
         (["file:///config/note.pdf"], "fallback"),
         (["/config/note.pdf"], "fallback"),
-        (["mailto:user@example.com?subject=Hi"], "fallback"),
-        (["tel:+15551234567"], "fallback"),
-        (["sms:+15551234567"], "fallback"),
+        (["mailto:user@example.com?subject=Hi"], "forward"),
+        (["mailto:"], "fallback"),
+        (["tel:+15551234567"], "forward"),
+        (["sms:+15551234567"], "forward"),
         (["ftp://example.com/file"], "fallback"),
         (["zotero://select/library/items/ABCD"], "fallback"),
         (["javascript:alert(1)"], "fallback"),
@@ -418,6 +503,83 @@ def test_launcher_routes_an_obsidian_uri_to_the_app(tmp_path: Path) -> None:
         == "obsidian://show-plugin?id=obsidian-importer"
     )
     assert not (tmp_path / "real-xdg-open-args").exists()
+
+
+@pytest.mark.parametrize(
+    "link",
+    ["tel:+15551234567", "sms:+15551234567?body=Hi"],
+)
+def test_launcher_forwards_phone_links(tmp_path: Path, link: str) -> None:
+    # Given a running daemon stub and a real-binary stub
+    stub = StubServer()
+    real = _write_real_stub(tmp_path)
+    env = {
+        **os.environ,
+        "OPEN_URL_ENDPOINT": stub.endpoint,
+        "XDG_OPEN_REAL": str(real),
+    }
+    try:
+        # When the launcher runs with a phone link
+        result = subprocess.run(
+            [str(LAUNCHER), link], env=env, capture_output=True, timeout=10
+        )
+    finally:
+        stub.close()
+    # Then the daemon received it and the real binary was not called
+    assert result.returncode == 0
+    assert stub.records[0]["body"] == {"url": link}
+    assert not (tmp_path / "real-xdg-open-args").exists()
+
+
+def test_email_launcher_forwards_mailto(tmp_path: Path) -> None:
+    # Given a running daemon stub and a real xdg-email stub
+    stub = StubServer()
+    email_real = tmp_path / "xdg-email-stub"
+    email_marker = tmp_path / "real-xdg-email-args"
+    email_real.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" > '{email_marker}'\n")
+    email_real.chmod(0o755)
+    env = {
+        **os.environ,
+        "OPEN_URL_ENDPOINT": stub.endpoint,
+        "XDG_EMAIL_REAL": str(email_real),
+    }
+    try:
+        # When the email launcher runs with a mail link
+        result = subprocess.run(
+            [str(EMAIL_LAUNCHER), "mailto:a@example.com?subject=Hi"],
+            env=env,
+            capture_output=True,
+            timeout=10,
+        )
+    finally:
+        stub.close()
+    # Then the daemon received it and the real binary was not called
+    assert result.returncode == 0
+    assert stub.records[0]["body"] == {"url": "mailto:a@example.com?subject=Hi"}
+    assert not email_marker.exists()
+
+
+def test_email_launcher_falls_back_when_the_daemon_is_down(tmp_path: Path) -> None:
+    # Given a dead daemon endpoint and a real xdg-email stub
+    email_real = tmp_path / "xdg-email-stub"
+    email_marker = tmp_path / "real-xdg-email-args"
+    email_real.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" > '{email_marker}'\n")
+    email_real.chmod(0o755)
+    env = {
+        **os.environ,
+        "OPEN_URL_ENDPOINT": "http://127.0.0.1:1/api/open-url",
+        "XDG_EMAIL_REAL": str(email_real),
+    }
+    # When the email launcher runs with a mail link
+    result = subprocess.run(
+        [str(EMAIL_LAUNCHER), "mailto:a@example.com"],
+        env=env,
+        capture_output=True,
+        timeout=10,
+    )
+    # Then the real xdg-email receives the original argument
+    assert result.returncode == 0
+    assert email_marker.read_text().strip() == "mailto:a@example.com"
 
 
 def test_launcher_falls_back_when_the_daemon_is_down(tmp_path: Path) -> None:

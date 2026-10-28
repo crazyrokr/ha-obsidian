@@ -12,6 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = ROOT / "obsidian" / "root" / "usr" / "local" / "bin" / "xdg-open"
+EMAIL_LAUNCHER = ROOT / "obsidian" / "root" / "usr" / "local" / "bin" / "xdg-email"
 SERVICE = ROOT / "obsidian" / "root" / "etc" / "services.d" / "open-url-api" / "run"
 DOCKERFILE = ROOT / "obsidian" / "Dockerfile"
 MODULE_DIR = ROOT / "obsidian" / "root" / "opt" / "ha-open-url"
@@ -29,6 +30,36 @@ def test_xdg_open_launcher_is_executable() -> None:
     # When its mode is inspected
     # Then it is executable
     assert _is_executable(LAUNCHER)
+
+
+def test_xdg_email_launcher_is_executable() -> None:
+    # Given the mail PATH overlay
+    # When its mode is inspected
+    # Then it is executable
+    assert _is_executable(EMAIL_LAUNCHER)
+
+
+def test_email_launcher_resolves_the_forwarder() -> None:
+    # Given the mail launcher
+    text = EMAIL_LAUNCHER.read_text(encoding="utf-8")
+    # Then it selects the email mode and resolves the module relative to itself
+    assert "OPEN_URL_MODE=email" in text
+    assert "../../../opt/ha-open-url/forwarder.py" in text
+
+
+def test_email_launcher_respects_desktop_hardening() -> None:
+    # Given the mail launcher
+    text = EMAIL_LAUNCHER.read_text(encoding="utf-8")
+    # Then it disables itself when the base image hardened xdg-open
+    assert '[ ! -x "$SELF_DIR/xdg-open" ]' in text
+    assert "exec /usr/bin/xdg-email" in text
+
+
+def test_dockerfile_makes_the_email_launcher_executable() -> None:
+    # Given the image build
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    # Then the mail launcher is chmodded with the open launcher
+    assert "/usr/local/bin/xdg-email" in text
 
 
 def test_open_url_service_is_executable() -> None:

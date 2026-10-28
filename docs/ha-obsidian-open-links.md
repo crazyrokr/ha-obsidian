@@ -1,14 +1,19 @@
 # Obsidian Add-on: Links Open in Your Browser
 
-This guide describes how the add-on forwards external `http(s)` links
-clicked in the streamed Obsidian app to the browser that is viewing the
-add-on, instead of opening them inside the container's desktop.
+This guide describes how the add-on forwards external links clicked in the
+streamed Obsidian app to the device that is viewing the add-on, instead of
+opening them inside the container's desktop.
 
 ## 1. Behavior
 
 - Clicking an `http(s)` link in Obsidian opens it in the viewing browser:
   a new tab when the browser allows the script-initiated open, or a compact
   **Open link in your browser?** toast whose **Open** button always works.
+- `mailto:`, `tel:` and `sms:` links open on the viewing device through a
+  toast (**Open this email?**, **Call this number?**, **Send this
+  message?**). The **Open** button is a real anchor click, because browsers
+  only launch an external protocol from a user gesture; nothing opens
+  automatically.
 - A single `obsidian://` deep link (for example the Importer plugin's
   `obsidian://show-plugin?id=obsidian-importer`) opens in the streamed
   Obsidian app itself.
@@ -16,9 +21,9 @@ add-on, instead of opening them inside the container's desktop.
   behavior and open in the in-container desktop.
 - Works through Home Assistant ingress (the side panel / Web UI iframe) and
   through the exposed HTTP (3000) / HTTPS (3001) ports.
-- The toast shows the destination host (the full URL is in its tooltip),
-  follows the active Home Assistant theme, and offers **Open**, **Copy** and
-  **Dismiss**.
+- The toast shows the destination host, recipient or number (the full URL
+  is in its tooltip), follows the active Home Assistant theme, and offers
+  **Open**, **Copy** and **Dismiss**.
 
 ### Link types
 
@@ -27,8 +32,9 @@ add-on, instead of opening them inside the container's desktop.
 | `http://`, `https://` | `shell.openExternal` → `xdg-open` → forwarder | the viewing browser, unless the Web viewer intercepts |
 | `obsidian://…` | `xdg-open` → forwarder → `/usr/bin/obsidian` | the streamed Obsidian app |
 | `file://…`, plain local paths | `xdg-open` → real binary | the in-container desktop |
-| `mailto:…` | Electron `xdg-email` (not `xdg-open`) | the container's mail handler; none is installed, so normally nothing |
-| `tel:`, `sms:`, `ftp:`, `zotero:` and other schemes | `shell.openExternal` → `xdg-open` → real binary | an in-container handler if one exists; otherwise the browser fallback may show a blank page |
+| `mailto:…` | Electron `xdg-email` → `/usr/local/bin/xdg-email` → forwarder | the viewing device's mail app, via the toast's **Open** |
+| `tel:…`, `sms:…` | `shell.openExternal` → `xdg-open` → forwarder | the viewing device's dialer or messages app, via the toast's **Open** |
+| `ftp:`, `zotero:` and other schemes | `shell.openExternal` → `xdg-open` → real binary | an in-container handler if one exists; otherwise the browser fallback may show a blank page |
 | `javascript:`, `data:`, malformed or over-long values | `xdg-open` | rejected by the forwarder; never queued for the viewing browser |
 | internal links, `[[wikilinks]]`, anchors, `app://` | Obsidian internal | never reach the OS |
 
@@ -36,11 +42,13 @@ Obsidian itself asks for confirmation before handing any scheme other than
 `http(s)`, `obsidian` and existing local files to the OS, with an "always
 open" checkbox; the add-on does not override that step.
 
-The rule is narrow by design: only `http(s)` is queued for the viewing
-browser, only `obsidian://` is routed to the app, and every other argument
-keeps the in-container behavior. `mailto:` is not forwarded — forwarding it
-would need an `xdg-email` overlay plus a daemon/client scheme allowlist (a
-separate follow-up), and the image installs no mail client anyway.
+The rule is an explicit allowlist: `http(s)`, `mailto:`, `tel:` and `sms:`
+are queued for the viewing browser, only `obsidian://` is routed to the
+app, and every other argument keeps the in-container behavior. Encoded
+CR/LF/NUL are rejected in the mail and phone payloads so a link cannot
+inject mail headers or message lines, and the client re-checks the scheme
+before opening anything. Arbitrary schemes are deliberately not forwarded;
+a link can only reach the device through the five-scheme allowlist.
 
 ## 2. Architecture
 
@@ -48,8 +56,12 @@ separate follow-up), and the image installs no mail client anyway.
 Obsidian (Electron)
   click link
     -> shell.openExternal
-       -> /usr/local/bin/xdg-open            PATH overlay
-          -> valid single http(s) URL?
+       -> mailto: ?
+          -> /usr/local/bin/xdg-email           PATH overlay
+             -> POST 127.0.0.1:8091/api/open-url  {"url": "..."}
+             -> on any failure: exec /usr/bin/xdg-email "$@"   (in-container)
+       -> /usr/local/bin/xdg-open               PATH overlay
+          -> valid single http(s)/tel/sms link?
              -> POST 127.0.0.1:8091/api/open-url  {"url": "..."}
                 -> bounded queue (8 items, 30 s TTL, 2 s dedupe)
           -> single obsidian:// deep link?
@@ -62,8 +74,8 @@ Viewing browser (Selkies dashboard page)
        -> nginx (GET-only, 70 s read timeout)
           -> open_url_server.py (S6 service, loopback 127.0.0.1:8091, as abc)
     -> 200 {"url": "...", "id": N}
-       -> try window.open(url, "_blank")
-          -> if blocked: show the anchor toast
+       -> http(s): try window.open(url, "_blank"), else show the anchor toast
+       -> mailto/tel/sms: show the anchor toast directly (Open is the gesture)
     -> 204 / 429 / error: re-poll or back off
 ```
 
@@ -99,10 +111,12 @@ Verified against the pinned base image
   hanging GET survives both hops.
 - The add-on ingress panel iframe in the Home Assistant frontend has no
   `sandbox` attribute, so a new tab from the dashboard is permitted.
-- Electron's `shell.openExternal` calls `xdg-open` for `http(s)` URLs and
-  `xdg-email` for `mailto:`. Obsidian's Web viewer core plugin is disabled
-  by default; once enabled it can route external links to the in-app viewer
-  instead of `xdg-open`.
+- Electron 43.8.3 special-cases `mailto:` to `xdg-email`; every other
+  URL, including `tel:` and `sms:`, goes to `xdg-open`. The image installs
+  no mail client, so the real `xdg-email` cannot open mail; the PATH overlay
+  is what delivers a `mailto:` when the daemon is running. Obsidian's Web
+  viewer core plugin is disabled by default; once enabled it can route
+  `http(s)` links to the in-app viewer instead of `xdg-open`.
 - The LinuxServer build extracts the Obsidian AppImage to `/opt/obsidian`
   but installs no `obsidian.desktop` scheme handler, so the real `xdg-open`
   cannot resolve `obsidian://` and falls through to Chromium, which renders
@@ -131,12 +145,19 @@ GET /api/open-url?wait=60   (browser, through nginx; GET only)
   -> 404 (other paths)
 ```
 
-- Only `http` and `https` are accepted. Empty, over-length (>8192),
-  whitespace, control-character, missing-host and other-scheme values are
-  rejected with 400 and never reach the browser.
+- Accepted schemes are `http`, `https`, `mailto`, `tel` and `sms`.
+  `http(s)` need a host; `mailto` needs a recipient; `tel` and `sms` need a
+  number. Empty targets, over-length (>8192), whitespace, control
+  characters, encoded CR/LF/NUL in the mail or phone payload, and
+  other-scheme values are rejected with 400 and never reach the browser.
+  The client re-checks the scheme and refuses anything outside the
+  allowlist, even if another process manages to enqueue it.
 - A single well-formed `obsidian://` argument is not queued: the forwarder
   execs `/usr/bin/obsidian` with it, so the running app handles the deep
   link. The viewing browser never sees it.
+- A single `mailto:`, `tel:` or `sms:` argument is queued like an `http(s)`
+  URL. The client shows the toast instead of opening a tab, because a
+  browser only launches an external protocol from a user gesture.
 - The queue holds at most 8 items, drops items older than 30 s, and
   collapses repeats of the same URL within 2 s. A URL is delivered to the
   first live waiting client; a client that disconnects is detected within
@@ -188,15 +209,18 @@ viewed from any device.
   `xdg-open`, which may show a blank in-container page; the log shows
   `scheme=obsidian outcome=app` on the working path and `outcome=fallback`
   otherwise.
-- **`mailto:` and other schemes.** They are intentionally not forwarded.
-  Electron hands `mailto:` to `xdg-email`; the image installs no mail
-  client, so normally nothing opens in the viewing browser. Other schemes
-  (`tel:`, `zotero:`, …) fall back to the in-container `xdg-open`; without
-  a handler, Chromium's fallback may show a blank in-container page. If the
-  session's `xdg-email` delegates to `xdg-open`, the add-on log shows
-  `scheme=mailto outcome=fallback`.
-- **`HARDEN_DESKTOP=true`.** The base image makes `xdg-open` non-executable,
-  so the feature is off by design.
+- **`mailto:`, `tel:` and `sms:` show a toast.** The browser will not
+  launch an external protocol without a user gesture, so the dashboard
+  waits for **Open**. If clicking it does nothing, the viewing device has
+  no mail, dialer or messages handler; **Copy** still works. The add-on log
+  shows `scheme=mailto|tel|sms outcome=forwarded`; `outcome=fallback`
+  means the daemon was unreachable and the link stayed in the container.
+- **Other schemes (`ftp:`, `zotero:`, …).** They are intentionally not
+  forwarded. The real `xdg-open` handles them in the container, and a
+  missing handler can leave a blank in-container page.
+- **`HARDEN_DESKTOP=true`.** The base image makes `xdg-open`
+  non-executable; the `xdg-email` launcher checks the same file and
+  disables itself, so the feature is off by design.
 - **Multiple viewers.** A queued link is consumed by the first waiting
   client. The add-on normally has one viewer.
 - **A user-provided reverse proxy with a short idle timeout.** The 60 s
@@ -222,18 +246,22 @@ viewed from any device.
    in streamed Obsidian, and the log shows `scheme=obsidian outcome=app`.
 8. Enable the Web viewer core plugin and click a link — it opens in the
    in-app viewer; disabling the plugin restores forwarding.
-9. Click a `mailto:` link — Obsidian's scheme warning appears (once);
-   after allowing, no tab opens in the viewing browser and the link does
-   not reach the toast.
-10. Click a `tel:` or `zotero://` link — the same warning; the link stays in
-    the container, where a blank page is expected when no handler exists.
-11. Repeat 2–3 in Chrome and Firefox (and one mobile client if available).
+9. Click a `mailto:` link — after Obsidian's one-time scheme warning, the
+   toast shows **Open this email?**; **Open** launches the viewing device's
+   mail app and the log shows `scheme=mailto outcome=forwarded`.
+10. Click a `tel:` or `sms:` link — the corresponding toast appears, and
+    **Open** launches the dialer or messages app on the viewing device.
+11. Click a `ftp:` or `zotero://` link — Obsidian's warning, then the link
+    stays in the container; a blank in-container page is expected when no
+    handler exists.
+12. Repeat 2–3 in Chrome and Firefox (and one mobile client if available).
 
 ## 8. Files
 
-- `obsidian/root/usr/local/bin/xdg-open` — PATH overlay launcher.
+- `obsidian/root/usr/local/bin/xdg-open` — link PATH overlay launcher.
+- `obsidian/root/usr/local/bin/xdg-email` — mail PATH overlay launcher.
 - `obsidian/root/opt/ha-open-url/forwarder.py` — validation, JSON POST,
-  Obsidian deep-link routing, fallback exec.
+  Obsidian deep-link routing, mode-aware fallback exec.
 - `obsidian/root/opt/ha-open-url/open_url_server.py` — queue, HTTP API,
   daemon entry point.
 - `obsidian/root/opt/ha-open-url/open-url.js` — dashboard client.

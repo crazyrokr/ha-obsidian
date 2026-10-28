@@ -1,9 +1,12 @@
-"""Forward http(s) xdg-open calls to the loopback link daemon.
+"""Forward link-opening calls to the loopback daemon.
 
-The forwarder runs behind the /usr/local/bin/xdg-open launcher. It forwards a
-single http(s) URL to the viewing browser, hands a single Obsidian deep link
-to the in-container app, and falls back to the real xdg-open for every other
-argument or when the chosen target cannot be reached.
+The forwarder runs behind the /usr/local/bin/xdg-open and xdg-email
+launchers. It forwards a single allowed link (http(s), mailto, tel or sms)
+to the viewing browser, hands a single Obsidian deep link to the
+in-container app in the default mode, and falls back for every other
+argument or when the chosen target cannot be reached. The email mode
+(selected by the xdg-email launcher) falls back to the real xdg-email
+instead of xdg-open.
 """
 
 from __future__ import annotations
@@ -19,13 +22,15 @@ from open_url_server import MAX_URL_LENGTH, validate_url
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:8091/api/open-url"
 DEFAULT_OBSIDIAN_LAUNCHER = "/usr/bin/obsidian"
+DEFAULT_REAL_XDG_EMAIL = "/usr/bin/xdg-email"
 DEFAULT_REAL_XDG_OPEN = "/usr/bin/xdg-open"
 DEFAULT_TIMEOUT = 2.0
+EMAIL_MODE = "email"
 OBSIDIAN_PREFIX = "obsidian://"
 
 
 def should_forward(argv: list[str]) -> bool:
-    """True when argv is exactly one URL the daemon accepts."""
+    """True when argv is exactly one link the daemon accepts."""
     if len(argv) != 1:
         return False
     try:
@@ -107,10 +112,14 @@ def _diagnose(argv: list[str], outcome: str, error: Exception | None = None) -> 
 
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
-    real = os.environ.get("XDG_OPEN_REAL", DEFAULT_REAL_XDG_OPEN)
+    mode = os.environ.get("OPEN_URL_MODE", "")
+    if mode == EMAIL_MODE:
+        real = os.environ.get("XDG_EMAIL_REAL", DEFAULT_REAL_XDG_EMAIL)
+    else:
+        real = os.environ.get("XDG_OPEN_REAL", DEFAULT_REAL_XDG_OPEN)
     endpoint = os.environ.get("OPEN_URL_ENDPOINT", DEFAULT_ENDPOINT)
     launcher = os.environ.get("OBSIDIAN_LAUNCHER", DEFAULT_OBSIDIAN_LAUNCHER)
-    if should_open_in_obsidian(args):
+    if mode != EMAIL_MODE and should_open_in_obsidian(args):
         _diagnose(args, "app")
         try:
             exec_app(args, launcher)

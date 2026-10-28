@@ -309,12 +309,83 @@ test("200 opens the URL in a new tab", async () => {
   assert.equal(browser.toast(), null);
 });
 
-test("200 ignores non-http schemes", async () => {
+test("mailto shows the toast without opening a tab", async () => {
+  // Given a delivered mail link
+  const link = "mailto:a@example.com?subject=Hi";
+  const browser = createBrowser({
+    behaviors: [() => Promise.resolve(jsonResponse({ url: link, id: 1 }))],
+  });
+  // When the script handles it
+  browser.load();
+  await browser.tick();
+  // Then no tab is opened and the toast asks for a real user click
+  assert.deepEqual(browser.openCalls, []);
+  const toast = browser.toast();
+  assert.ok(toast);
+  assert.equal(
+    findByClass(toast, "ha-open-url-title").textContent,
+    "Open this email?"
+  );
+  const host = findByClass(toast, "ha-open-url-host");
+  assert.equal(host.textContent, "a@example.com");
+  assert.equal(host.attributes.title, link);
+  const open = findByClass(toast, "ha-open-url-open");
+  assert.equal(open.attributes.href, link);
+  assert.equal(open.attributes.target, undefined);
+});
+
+test("tel shows the call toast", async () => {
+  // Given a delivered phone link
+  const link = "tel:+15551234567";
+  const browser = createBrowser({
+    behaviors: [() => Promise.resolve(jsonResponse({ url: link, id: 1 }))],
+  });
+  // When the script handles it
+  browser.load();
+  await browser.tick();
+  // Then no tab is opened and the toast offers the call
+  assert.deepEqual(browser.openCalls, []);
+  const toast = browser.toast();
+  assert.equal(
+    findByClass(toast, "ha-open-url-title").textContent,
+    "Call this number?"
+  );
+  assert.equal(findByClass(toast, "ha-open-url-host").textContent, "+15551234567");
+  const open = findByClass(toast, "ha-open-url-open");
+  assert.equal(open.attributes.href, link);
+  assert.equal(open.attributes.target, undefined);
+});
+
+test("sms shows the message toast", async () => {
+  // Given a delivered message link
+  const link = "sms:+15551234567?body=Hi";
+  const browser = createBrowser({
+    behaviors: [() => Promise.resolve(jsonResponse({ url: link, id: 1 }))],
+  });
+  // When the script handles it
+  browser.load();
+  await browser.tick();
+  // Then no tab is opened and the toast offers the message
+  assert.deepEqual(browser.openCalls, []);
+  const toast = browser.toast();
+  assert.equal(
+    findByClass(toast, "ha-open-url-title").textContent,
+    "Send this message?"
+  );
+  assert.equal(findByClass(toast, "ha-open-url-host").textContent, "+15551234567");
+  const open = findByClass(toast, "ha-open-url-open");
+  assert.equal(open.attributes.href, link);
+  assert.equal(open.attributes.target, undefined);
+});
+
+test("200 ignores unsupported schemes", async () => {
   // Given responses carrying disallowed schemes
   const browser = createBrowser({
     behaviors: [
       () => Promise.resolve(jsonResponse({ url: "javascript:alert(1)", id: 1 })),
       () => Promise.resolve(jsonResponse({ url: "file:///etc/passwd", id: 2 })),
+      () => Promise.resolve(jsonResponse({ url: "ftp://example.com/x", id: 3 })),
+      () => Promise.resolve(jsonResponse({ url: "obsidian://open?vault=main", id: 4 })),
     ],
   });
   // When the script handles each one
@@ -326,6 +397,11 @@ test("200 ignores non-http schemes", async () => {
   assert.deepEqual(browser.pendingDelays(), [0]);
   browser.runTimeouts();
   await browser.tick();
+  browser.runTimeouts();
+  await browser.tick();
+  browser.runTimeouts();
+  await browser.tick();
+  // Then every unsupported scheme is ignored and polling continues
   assert.deepEqual(browser.openCalls, []);
   assert.equal(browser.toast(), null);
   assert.deepEqual(browser.pendingDelays(), [0]);

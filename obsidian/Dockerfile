@@ -3,8 +3,8 @@ FROM lscr.io/linuxserver/obsidian:v1.14.5-ls150@sha256:da0e7e082b5922fe9f9065254
 RUN mkdir /share
 COPY root /
 
-# The PATH overlay and the S6 service must be executable in the image.
-RUN chmod 0755 /usr/local/bin/xdg-open /etc/services.d/open-url-api/run
+# The PATH overlays and the S6 service must be executable in the image.
+RUN chmod 0755 /usr/local/bin/xdg-open /usr/local/bin/xdg-email /etc/services.d/open-url-api/run
 
 # The theme-sync daemon keeps the desktop background in the theme's color.
 # swaybg paints the nested labwc compositor in Wayland mode; in X mode the

@@ -30,6 +30,10 @@ import open_url_server as ts  # noqa: E402
         "http://example.com",
         "HTTPS://EXAMPLE.COM/path",
         "https://example.com/" + "a" * (ts.MAX_URL_LENGTH - len("https://example.com/")),
+        "mailto:a@example.com?subject=Hello",
+        "mailto:?subject=Hello",
+        "tel:+15551234567",
+        "sms:+15551234567?body=Hello",
     ],
 )
 def test_valid_urls_are_returned_unchanged(value: str) -> None:
@@ -50,7 +54,13 @@ def test_valid_urls_are_returned_unchanged(value: str) -> None:
         "javascript:alert(1)",
         "data:text/html,x",
         "file:///etc/passwd",
-        "mailto:a@b.c",
+        "mailto:",
+        "mailto:?subject=Hello%0AInjected",
+        "mailto:a@example.com%00",
+        "tel:",
+        "tel:?ext=1",
+        "sms:?body=Hello",
+        "sms:+15551234567%0D%0A",
         "ftp://example.com",
         " https://example.com",
         "https://exam ple.com",
@@ -308,6 +318,23 @@ def test_post_queues_url(server) -> None:
     assert headers["Cache-Control"] == "no-store"
     # And the queue holds it
     assert server.pending.take(0) == (payload["id"], "https://example.com/a")
+
+
+def test_post_queues_a_mail_link(server) -> None:
+    # Given a running daemon
+    # When a mail link is posted
+    status, _, body = _post_json(
+        server,
+        "/api/open-url",
+        {"url": "mailto:a@example.com?subject=Hello"},
+    )
+    payload = json.loads(body)
+    # Then it is queued like any other allowed link
+    assert status == 202
+    assert server.pending.take(0) == (
+        payload["id"],
+        "mailto:a@example.com?subject=Hello",
+    )
 
 
 def test_post_rejects_invalid_scheme(server) -> None:

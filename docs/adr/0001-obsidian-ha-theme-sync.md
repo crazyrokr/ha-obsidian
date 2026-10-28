@@ -181,16 +181,18 @@ detects the HA theme and posts it to the daemon through nginx.
     change (and the build-time grep guard would need a second anchor),
     while the one-rule override depends only on CSS cascade order.
 11. **External links open in the viewing browser.** A `xdg-open` PATH
-    overlay (`/usr/local/bin/xdg-open`) forwards a single `http(s)` URL to a
-    dedicated loopback daemon (`127.0.0.1:8091`) and execs the real
-    `/usr/bin/xdg-open` for every other argument or on any failure. The
-    daemon holds a bounded queue (8 items, 30 s TTL, 2 s dedupe) and serves
-    it through a 60 s hanging GET that nginx exposes as GET-only
-    (`limit_except GET { deny all; }`), behind ingress authentication. A
-    dashboard script derives the endpoint from the page location, opens the
-    URL with `window.open`, and falls back to a clickable anchor toast when
-    the browser blocks the popup. Only the in-container wrapper can enqueue
-    a URL; the external surface is read-only. Rejected alternatives: the
+    overlay (`/usr/local/bin/xdg-open`) forwards a single allowed link
+    (`http(s)`, `tel`, `sms`) to a dedicated loopback daemon
+    (`127.0.0.1:8091`) and execs the real `/usr/bin/xdg-open` for every
+    other argument or on any failure. The daemon holds a bounded queue (8
+    items, 30 s TTL, 2 s dedupe) and serves it through a 60 s hanging GET
+    that nginx exposes as GET-only (`limit_except GET { deny all; }`),
+    behind ingress authentication. A dashboard script derives the endpoint
+    from the page location, opens an `http(s)` URL with `window.open`, and
+    uses a clickable anchor toast when the browser blocks the popup or
+    when the link is `mailto:`, `tel:` or `sms:`. Only the in-container
+    wrappers can enqueue a link; the external surface is read-only.
+    Rejected alternatives: the
     host-listener/`host.docker.internal` recipe (the add-on manifest has no
     `extra_hosts`, the HA host is headless, and the client browser is the
     right target), short polling (wakes continuously), SSE (removes request
@@ -198,8 +200,20 @@ detects the HA theme and posts it to the daemon through nginx.
     complexity), WebSocket (an RFC 6455 implementation or a dependency for
     a one-way channel), extending the theme daemon on 8090 (couples
     unrelated concerns), and replacing `/usr/bin/xdg-open` in place
-    (fragile distribution edit). `mailto:` is out of scope because Electron
-    uses `xdg-email`. When Obsidian's Web viewer plugin is enabled it
+    (fragile distribution edit). Electron special-cases `mailto:` to
+    `xdg-email`, so a second PATH overlay (`/usr/local/bin/xdg-email`)
+    forwards a single `mailto:` to the same daemon and falls back to the
+    real `/usr/bin/xdg-email`; `tel:` and `sms:` reach the `xdg-open`
+    overlay. The daemon accepts exactly `http`, `https`, `mailto`, `tel`
+    and `sms`, requires a host, recipient or number as appropriate, and
+    rejects encoded CR/LF/NUL in the mail and phone payloads so a link
+    cannot inject headers or message lines. For the three external-protocol
+    schemes the client shows the toast directly rather than calling
+    `window.open`: browsers only launch an external protocol from a user
+    gesture, and an optimistic call tends to leave a blank tab. Rejected
+    alternative: forwarding arbitrary schemes to the viewing browser (a
+    capability and phishing surface; the five-scheme allowlist is the
+    boundary). When Obsidian's Web viewer plugin is enabled it
     intentionally bypasses `xdg-open`; disabling the plugin, or using the
     link's right-click "Open in default browser", restores forwarding.
     An `obsidian://` deep link is not an external link: the add-on's own
@@ -219,7 +233,8 @@ detects the HA theme and posts it to the daemon through nginx.
     installing an `obsidian.desktop` plus mimeapps registration (a second
     handler surface whose result still depends on the headless session's
     generic `xdg-open` mime path, while the PATH overlay already owns the
-    dispatch). A launcher failure falls back to the real `xdg-open`.
+    dispatch). A launcher failure falls back to the corresponding real
+    binary (`xdg-open` or `xdg-email`).
 
 ## Consequences
 
@@ -289,13 +304,17 @@ detects the HA theme and posts it to the daemon through nginx.
   never through a shell. If the launcher cannot be executed, the forwarder
   falls back to the real `xdg-open`, which may show the previous blank
   in-container page.
-- Non-web schemes are unchanged by design: Electron hands `mailto:` to
-  `xdg-email` (the image installs no mail client, so it normally does
-  nothing), and other schemes fall back to the real `xdg-open`, which may
-  hit Chromium's browser fallback for an unregistered scheme. Only
-  `http(s)` is forwarded to the viewing browser and only `obsidian://` is
-  routed to the app; widening that is a policy decision (an `xdg-email`
-  overlay plus a scheme allowlist), not an oversight.
+- The image carries a second PATH overlay (`xdg-email`) and a mode switch
+  in the forwarder. A `mailto:` is queued only while the daemon is up; if
+  the launcher cannot reach it, the real `xdg-email` receives the link, and
+  the image has no mail client to open it.
+- The client allows exactly `http`, `https`, `mailto`, `tel` and `sms`.
+  `mailto`, `tel` and `sms` are toast-first (one user click) instead of
+  optimistic, because external-protocol launches require a user gesture.
+  Other schemes still fall back to the real `xdg-open` in the container,
+  where a missing handler may leave a blank page.
+- Encoded CR/LF/NUL are rejected for the mail and phone schemes; the queue
+  and the client never accept an arbitrary scheme.
 - `HARDEN_DESKTOP=true` makes the base image `chmod 0000` the resolved
   `xdg-open`, which disables the feature by design.
 - The feature depends on the Selkies nginx template and the dashboard
