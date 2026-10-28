@@ -9,6 +9,9 @@ add-on, instead of opening them inside the container's desktop.
 - Clicking an `http(s)` link in Obsidian opens it in the viewing browser:
   a new tab when the browser allows the script-initiated open, or a compact
   **Open link in your browser?** toast whose **Open** button always works.
+- A single `obsidian://` deep link (for example the Importer plugin's
+  `obsidian://show-plugin?id=obsidian-importer`) opens in the streamed
+  Obsidian app itself.
 - Local attachments and every other `xdg-open` argument keep the previous
   behavior and open in the in-container desktop.
 - Works through Home Assistant ingress (the side panel / Web UI iframe) and
@@ -21,13 +24,15 @@ add-on, instead of opening them inside the container's desktop.
 
 ```text
 Obsidian (Electron)
-  click http(s) link
+  click link
     -> shell.openExternal
        -> /usr/local/bin/xdg-open            PATH overlay
           -> valid single http(s) URL?
              -> POST 127.0.0.1:8091/api/open-url  {"url": "..."}
                 -> bounded queue (8 items, 30 s TTL, 2 s dedupe)
-             -> on any failure: exec /usr/bin/xdg-open "$@"   (in-container)
+          -> single obsidian:// deep link?
+             -> exec /usr/bin/obsidian "$uri"  (the running app receives it)
+          -> otherwise, or on any failure: exec /usr/bin/xdg-open "$@"   (in-container)
 
 Viewing browser (Selkies dashboard page)
   open-url.js (classic <script> in the dashboard source HTML)
@@ -76,6 +81,17 @@ Verified against the pinned base image
   `xdg-email` for `mailto:`. Obsidian's Web viewer core plugin is disabled
   by default; once enabled it can route external links to the in-app viewer
   instead of `xdg-open`.
+- The LinuxServer build extracts the Obsidian AppImage to `/opt/obsidian`
+  but installs no `obsidian.desktop` scheme handler, so the real `xdg-open`
+  cannot resolve `obsidian://` and falls through to Chromium, which renders
+  a blank page. `/usr/bin/obsidian` forwards every argument to
+  `/opt/obsidian/obsidian --no-sandbox`; Obsidian's documented Linux
+  protocol handling takes the URI as an argument (`Exec=... %u`). Verified
+  against the pinned 1.14.5 bundle: the second launch filters `--` flags
+  and sends the remaining arguments over the app's CLI socket
+  (`$XDG_RUNTIME_DIR/.obsidian-cli.sock`), and the running instance handles
+  a trailing `obsidian://` argument. The forwarder passes the URI as the
+  only non-flag argument, so it is last.
 
 ## 4. Protocol
 
@@ -96,6 +112,9 @@ GET /api/open-url?wait=60   (browser, through nginx; GET only)
 - Only `http` and `https` are accepted. Empty, over-length (>8192),
   whitespace, control-character, missing-host and other-scheme values are
   rejected with 400 and never reach the browser.
+- A single well-formed `obsidian://` argument is not queued: the forwarder
+  execs `/usr/bin/obsidian` with it, so the running app handles the deep
+  link. The viewing browser never sees it.
 - The queue holds at most 8 items, drops items older than 30 s, and
   collapses repeats of the same URL within 2 s. A URL is delivered to the
   first live waiting client; a client that disconnects is detected within
@@ -141,6 +160,12 @@ viewed from any device.
 - **The popup is blocked.** Click **Open** in the toast; a real anchor click
   is a user gesture and is allowed even when script-initiated popups are
   blocked.
+- **`obsidian://` links.** They are handed to the in-container app, so the
+  plugin or note screen opens in streamed Obsidian, not the browser. If the
+  launcher cannot be executed the forwarder falls back to the real
+  `xdg-open`, which may show a blank in-container page; the log shows
+  `scheme=obsidian outcome=app` on the working path and `outcome=fallback`
+  otherwise.
 - **`mailto:` and other schemes.** Electron uses `xdg-email` for `mailto:`
   and other schemes are not forwarded; this is out of scope.
 - **`HARDEN_DESKTOP=true`.** The base image makes `xdg-open` non-executable,
@@ -165,15 +190,18 @@ viewed from any device.
 5. `xdg-open /config/some-file.pdf` — in-container behavior, unchanged.
 6. `xdg-open 'javascript:alert(1)'` and `xdg-open 'file:///etc/passwd'` —
    not forwarded.
-7. Enable the Web viewer core plugin and click a link — it opens in the
+7. Click an `obsidian://` link (for example
+   `obsidian://show-plugin?id=obsidian-importer`) — the plugin screen opens
+   in streamed Obsidian, and the log shows `scheme=obsidian outcome=app`.
+8. Enable the Web viewer core plugin and click a link — it opens in the
    in-app viewer; disabling the plugin restores forwarding.
-8. Repeat 2–3 in Chrome and Firefox (and one mobile client if available).
+9. Repeat 2–3 in Chrome and Firefox (and one mobile client if available).
 
 ## 8. Files
 
 - `obsidian/root/usr/local/bin/xdg-open` — PATH overlay launcher.
 - `obsidian/root/opt/ha-open-url/forwarder.py` — validation, JSON POST,
-  fallback exec.
+  Obsidian deep-link routing, fallback exec.
 - `obsidian/root/opt/ha-open-url/open_url_server.py` — queue, HTTP API,
   daemon entry point.
 - `obsidian/root/opt/ha-open-url/open-url.js` — dashboard client.

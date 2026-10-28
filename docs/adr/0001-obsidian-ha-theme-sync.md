@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-09-06
-- Last updated: 2026-10-27
+- Last updated: 2026-10-28
 - Deciders: maintainers
 
 ## Context
@@ -202,6 +202,24 @@ detects the HA theme and posts it to the daemon through nginx.
     uses `xdg-email`. When Obsidian's Web viewer plugin is enabled it
     intentionally bypasses `xdg-open`; disabling the plugin, or using the
     link's right-click "Open in default browser", restores forwarding.
+    An `obsidian://` deep link is not an external link: the add-on's own
+    app is its intended handler. A single well-formed `obsidian://`
+    argument is therefore executed against the in-container launcher
+    (`/usr/bin/obsidian <uri>`), whose arguments reach
+    `/opt/obsidian/obsidian --no-sandbox`; Obsidian's documented Linux
+    protocol handling receives the URI as an argument (`Exec=... %u`), a
+    second launch sends its non-flag arguments over the app's CLI socket,
+    and the running instance handles a trailing `obsidian://` argument
+    (verified against the pinned 1.14.5 bundle). Without this route the
+    base image extracts the AppImage without an
+    `obsidian.desktop` handler, so the real `xdg-open` falls through to
+    Chromium and renders a blank page. Rejected alternatives: forwarding
+    the deep link to the viewing browser (the URI names a vault and plugins
+    of the container's app, and the client need not have Obsidian), and
+    installing an `obsidian.desktop` plus mimeapps registration (a second
+    handler surface whose result still depends on the headless session's
+    generic `xdg-open` mime path, while the PATH overlay already owns the
+    dispatch). A launcher failure falls back to the real `xdg-open`.
 
 ## Consequences
 
@@ -266,6 +284,11 @@ detects the HA theme and posts it to the daemon through nginx.
 - The forwarder runs on every `xdg-open` call. Non-URL arguments and daemon
   failures fall back to the real binary, so local attachments and the
   previous behavior are unchanged.
+- A single `obsidian://` argument is routed to the app launcher instead of
+  the real `xdg-open`; the URI is passed as one argument through `execv`,
+  never through a shell. If the launcher cannot be executed, the forwarder
+  falls back to the real `xdg-open`, which may show the previous blank
+  in-container page.
 - `HARDEN_DESKTOP=true` makes the base image `chmod 0000` the resolved
   `xdg-open`, which disables the feature by design.
 - The feature depends on the Selkies nginx template and the dashboard

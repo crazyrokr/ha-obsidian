@@ -1,8 +1,9 @@
 """Forward http(s) xdg-open calls to the loopback link daemon.
 
 The forwarder runs behind the /usr/local/bin/xdg-open launcher. It forwards a
-single http(s) URL and falls back to the real xdg-open for every other
-argument or when the daemon cannot be reached.
+single http(s) URL to the viewing browser, hands a single Obsidian deep link
+to the in-container app, and falls back to the real xdg-open for every other
+argument or when the chosen target cannot be reached.
 """
 
 from __future__ import annotations
@@ -14,11 +15,13 @@ import urllib.request
 from typing import NoReturn
 from urllib.parse import urlsplit
 
-from open_url_server import validate_url
+from open_url_server import MAX_URL_LENGTH, validate_url
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:8091/api/open-url"
+DEFAULT_OBSIDIAN_LAUNCHER = "/usr/bin/obsidian"
 DEFAULT_REAL_XDG_OPEN = "/usr/bin/xdg-open"
 DEFAULT_TIMEOUT = 2.0
+OBSIDIAN_PREFIX = "obsidian://"
 
 
 def should_forward(argv: list[str]) -> bool:
@@ -30,6 +33,31 @@ def should_forward(argv: list[str]) -> bool:
     except ValueError:
         return False
     return True
+
+
+def should_open_in_obsidian(argv: list[str]) -> bool:
+    """True when argv is exactly one obsidian:// deep link the app accepts.
+
+    The prefix check is case-sensitive because Obsidian's own handler is:
+    an upper-case scheme would be ignored by the running instance.
+    """
+    if len(argv) != 1:
+        return False
+    value = argv[0]
+    if not value.startswith(OBSIDIAN_PREFIX):
+        return False
+    if not 0 < len(value) <= MAX_URL_LENGTH:
+        return False
+    if any(
+        character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F
+        for character in value
+    ):
+        return False
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    return bool(parsed.netloc)
 
 
 def send(
@@ -48,6 +76,11 @@ def send(
     with urllib.request.urlopen(request, timeout=timeout) as response:
         if not 200 <= response.status < 300:
             raise OSError(f"link daemon returned {response.status}")
+
+
+def exec_app(argv: list[str], launcher: str = DEFAULT_OBSIDIAN_LAUNCHER) -> NoReturn:
+    """Replace this process with the Obsidian launcher."""
+    os.execv(launcher, [launcher, *argv])
 
 
 def exec_real(argv: list[str], real: str = DEFAULT_REAL_XDG_OPEN) -> NoReturn:
@@ -76,6 +109,14 @@ def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     real = os.environ.get("XDG_OPEN_REAL", DEFAULT_REAL_XDG_OPEN)
     endpoint = os.environ.get("OPEN_URL_ENDPOINT", DEFAULT_ENDPOINT)
+    launcher = os.environ.get("OBSIDIAN_LAUNCHER", DEFAULT_OBSIDIAN_LAUNCHER)
+    if should_open_in_obsidian(args):
+        _diagnose(args, "app")
+        try:
+            exec_app(args, launcher)
+        except OSError as error:
+            _diagnose(args, "fallback", error)
+            exec_real(args, real)
     if not should_forward(args):
         _diagnose(args, "fallback")
         exec_real(args, real)

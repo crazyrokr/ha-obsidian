@@ -107,6 +107,97 @@ def test_should_forward(argv: list[str], expected: bool) -> None:
     assert result is expected
 
 
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["obsidian://show-plugin?id=obsidian-importer"], True),
+        (["obsidian://open?vault=main&file=Note"], True),
+        (["OBSIDIAN://show-plugin?id=obsidian-importer"], False),
+        (["Obsidian://show-plugin?id=obsidian-importer"], False),
+        (["obsidian://"], False),
+        (["obsidian:show-plugin?id=obsidian-importer"], False),
+        (["obsidian:///show-plugin?id=obsidian-importer"], False),
+        (["https://example.com"], False),
+        (["file:///etc/passwd"], False),
+        (["obsidian://open", "obsidian://open"], False),
+        ([], False),
+        (["obsidian://open\n"], False),
+        (["obsidian://open?" + "a" * 8192], False),
+    ],
+)
+def test_should_open_in_obsidian(argv: list[str], expected: bool) -> None:
+    # Given an argument list
+    # When deciding whether it is a single Obsidian deep link
+    result = forwarder.should_open_in_obsidian(argv)
+    # Then only one well-formed obsidian:// URI with an action is accepted
+    assert result is expected
+
+
+def test_main_opens_an_obsidian_uri_in_the_app(monkeypatch) -> None:
+    # Given a single Obsidian deep link and stubs for every other path
+    calls: list[tuple[list[str], str]] = []
+
+    def fake_app(argv: list[str], launcher: str) -> None:
+        calls.append((list(argv), launcher))
+        raise SystemExit(0)
+
+    def fail(*args, **kwargs):
+        raise AssertionError("must not forward or fall back")
+
+    monkeypatch.setattr(forwarder, "exec_app", fake_app)
+    monkeypatch.setattr(forwarder, "exec_real", fail)
+    monkeypatch.setattr(forwarder, "send", fail)
+    monkeypatch.setenv("OBSIDIAN_LAUNCHER", "/usr/bin/obsidian")
+    with pytest.raises(SystemExit):
+        # When the forwarder runs
+        forwarder.main(["obsidian://show-plugin?id=obsidian-importer"])
+    # Then the app launcher receives the URI unchanged
+    assert calls == [
+        (["obsidian://show-plugin?id=obsidian-importer"], "/usr/bin/obsidian")
+    ]
+
+
+def test_main_falls_back_when_the_obsidian_launcher_fails(monkeypatch) -> None:
+    # Given a deep link and a launcher that cannot be executed
+    calls: list[tuple[list[str], str]] = []
+
+    def fake_app(argv: list[str], launcher: str) -> None:
+        raise OSError("launcher missing")
+
+    def fake_real(argv: list[str], real: str) -> None:
+        calls.append((list(argv), real))
+        raise SystemExit(0)
+
+    monkeypatch.setattr(forwarder, "exec_app", fake_app)
+    monkeypatch.setattr(forwarder, "exec_real", fake_real)
+    monkeypatch.setenv("OBSIDIAN_LAUNCHER", "/missing/obsidian")
+    monkeypatch.setenv("XDG_OPEN_REAL", "/usr/bin/true")
+    with pytest.raises(SystemExit):
+        # When the forwarder runs
+        forwarder.main(["obsidian://show-plugin?id=obsidian-importer"])
+    # Then the real xdg-open receives the original argument
+    assert calls == [
+        (["obsidian://show-plugin?id=obsidian-importer"], "/usr/bin/true")
+    ]
+
+
+def test_obsidian_diagnostics_do_not_include_the_full_uri(monkeypatch, capsys) -> None:
+    # Given a deep link carrying a private vault and file name
+
+    def fake_app(argv: list[str], launcher: str) -> None:
+        raise SystemExit(0)
+
+    monkeypatch.setattr(forwarder, "exec_app", fake_app)
+    with pytest.raises(SystemExit):
+        # When the forwarder runs
+        forwarder.main(["obsidian://open?vault=private&file=secret-note"])
+    # Then only the scheme and action are logged
+    stderr = capsys.readouterr().err
+    assert "scheme=obsidian" in stderr
+    assert "secret-note" not in stderr
+    assert "private" not in stderr
+
+
 def test_send_posts_json() -> None:
     # Given a running daemon stub
     stub = StubServer()
@@ -245,6 +336,35 @@ def test_launcher_forwards_to_the_daemon(tmp_path: Path) -> None:
     assert result.returncode == 0
     assert stub.records[0]["body"] == {"url": "https://example.com/launch"}
     assert not marker.exists()
+
+
+def test_launcher_routes_an_obsidian_uri_to_the_app(tmp_path: Path) -> None:
+    # Given an app-launcher stub, a real-binary stub and a dead daemon
+    app = tmp_path / "obsidian-stub"
+    app_marker = tmp_path / "obsidian-args"
+    app.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" > '{app_marker}'\n")
+    app.chmod(0o755)
+    real = _write_real_stub(tmp_path)
+    env = {
+        **os.environ,
+        "OBSIDIAN_LAUNCHER": str(app),
+        "XDG_OPEN_REAL": str(real),
+        "OPEN_URL_ENDPOINT": "http://127.0.0.1:1/api/open-url",
+    }
+    # When the launcher runs with a single Obsidian deep link
+    result = subprocess.run(
+        [str(LAUNCHER), "obsidian://show-plugin?id=obsidian-importer"],
+        env=env,
+        capture_output=True,
+        timeout=10,
+    )
+    # Then the app receives it and the real xdg-open is not called
+    assert result.returncode == 0
+    assert (
+        app_marker.read_text().strip()
+        == "obsidian://show-plugin?id=obsidian-importer"
+    )
+    assert not (tmp_path / "real-xdg-open-args").exists()
 
 
 def test_launcher_falls_back_when_the_daemon_is_down(tmp_path: Path) -> None:

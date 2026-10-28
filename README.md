@@ -44,8 +44,9 @@ all without a restart.
   paint.
 - **Links open in your browser.** External `http(s)` links clicked in the
   streamed Obsidian open in the browser that is viewing the add-on — a new
-  tab when allowed, or a one-click toast. Local attachments and other
-  `xdg-open` calls still open in the in-container desktop.
+  tab when allowed, or a one-click toast. `obsidian://` deep links open in
+  the streamed app itself. Local attachments and other `xdg-open` calls
+  still open in the in-container desktop.
 - **Safe by design.** Theme writes go through a loopback-only daemon
   (`127.0.0.1:8090`) behind nginx, with strict API semantics (400 on
   unknown themes, 404 elsewhere) and atomic, ownership-safe writes to the
@@ -95,8 +96,10 @@ Obsidian's `xdg-open` calls for external links are intercepted by a PATH
 overlay and posted to a second loopback daemon. A client script in the
 dashboard holds a 60 s hanging GET and opens the delivered URL in the
 viewing browser, with a clickable toast when the browser blocks the popup.
-The full design, the verified base-image facts, and the live verification
-steps are in
+A single `obsidian://` deep link takes a different route: it is handed to
+the in-container app so the plugin or note screen opens in streamed
+Obsidian. The full design, the verified base-image facts, and the live
+verification steps are in
 [`docs/ha-obsidian-open-links.md`](docs/ha-obsidian-open-links.md).
 
 ## Documentation
