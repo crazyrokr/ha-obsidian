@@ -1,0 +1,7 @@
+#!/bin/sh
+SELF_DIR=$(unset CDPATH && cd -- "$(dirname -- "$0")" && pwd)
+if [ ! -x "$SELF_DIR/xdg-open" ]; then
+  exec /usr/bin/xdg-email "$@"
+fi
+export OPEN_URL_MODE=email
+exec /usr/bin/python3 "$SELF_DIR/../../../opt/ha-open-url/forwarder.py" "$@"

@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-09-06
-- Last updated: 2026-09-21
+- Last updated: 2026-10-28
 - Deciders: maintainers
 
 ## Context
@@ -180,6 +180,61 @@ detects the HA theme and posts it to the daemon through nginx.
     hardcoded rule is version-specific markup that a base-image bump would
     change (and the build-time grep guard would need a second anchor),
     while the one-rule override depends only on CSS cascade order.
+11. **External links open in the viewing browser.** A `xdg-open` PATH
+    overlay (`/usr/local/bin/xdg-open`) forwards a single allowed link
+    (`http(s)`, `tel`, `sms`) to a dedicated loopback daemon
+    (`127.0.0.1:8091`) and execs the real `/usr/bin/xdg-open` for every
+    other argument or on any failure. The daemon holds a bounded queue (8
+    items, 30 s TTL, 2 s dedupe) and serves it through a 60 s hanging GET
+    that nginx exposes as GET-only (`limit_except GET { deny all; }`),
+    behind ingress authentication. A dashboard script derives the endpoint
+    from the page location, opens an `http(s)` URL with `window.open`, and
+    uses a clickable anchor toast when the browser blocks the popup or
+    when the link is `mailto:`, `tel:` or `sms:`. Only the in-container
+    wrappers can enqueue a link; the external surface is read-only.
+    Rejected alternatives: the
+    host-listener/`host.docker.internal` recipe (the add-on manifest has no
+    `extra_hosts`, the HA host is headless, and the client browser is the
+    right target), short polling (wakes continuously), SSE (removes request
+    churn but not idle CPU, and adds streaming and proxy-buffering
+    complexity), WebSocket (an RFC 6455 implementation or a dependency for
+    a one-way channel), extending the theme daemon on 8090 (couples
+    unrelated concerns), and replacing `/usr/bin/xdg-open` in place
+    (fragile distribution edit). Electron special-cases `mailto:` to
+    `xdg-email`, so a second PATH overlay (`/usr/local/bin/xdg-email`)
+    forwards a single `mailto:` to the same daemon and falls back to the
+    real `/usr/bin/xdg-email`; `tel:` and `sms:` reach the `xdg-open`
+    overlay. The daemon accepts exactly `http`, `https`, `mailto`, `tel`
+    and `sms`, requires a host, recipient or number as appropriate, and
+    rejects encoded CR/LF/NUL in the mail and phone payloads so a link
+    cannot inject headers or message lines. For the three external-protocol
+    schemes the client shows the toast directly rather than calling
+    `window.open`: browsers only launch an external protocol from a user
+    gesture, and an optimistic call tends to leave a blank tab. Rejected
+    alternative: forwarding arbitrary schemes to the viewing browser (a
+    capability and phishing surface; the five-scheme allowlist is the
+    boundary). When Obsidian's Web viewer plugin is enabled it
+    intentionally bypasses `xdg-open`; disabling the plugin, or using the
+    link's right-click "Open in default browser", restores forwarding.
+    An `obsidian://` deep link is not an external link: the add-on's own
+    app is its intended handler. A single well-formed `obsidian://`
+    argument is therefore executed against the in-container launcher
+    (`/usr/bin/obsidian <uri>`), whose arguments reach
+    `/opt/obsidian/obsidian --no-sandbox`; Obsidian's documented Linux
+    protocol handling receives the URI as an argument (`Exec=... %u`), a
+    second launch sends its non-flag arguments over the app's CLI socket,
+    and the running instance handles a trailing `obsidian://` argument
+    (verified against the pinned 1.14.5 bundle). Without this route the
+    base image extracts the AppImage without an
+    `obsidian.desktop` handler, so the real `xdg-open` falls through to
+    Chromium and renders a blank page. Rejected alternatives: forwarding
+    the deep link to the viewing browser (the URI names a vault and plugins
+    of the container's app, and the client need not have Obsidian), and
+    installing an `obsidian.desktop` plus mimeapps registration (a second
+    handler surface whose result still depends on the headless session's
+    generic `xdg-open` mime path, while the PATH overlay already owns the
+    dispatch). A launcher failure falls back to the corresponding real
+    binary (`xdg-open` or `xdg-email`).
 
 ## Consequences
 
@@ -233,3 +288,38 @@ detects the HA theme and posts it to the daemon through nginx.
   the HA theme, the same contract as the vault's `appearance.json`; the
   write is best-effort (private-mode browsers simply keep the app default)
   and it never affects the theme request itself.
+- The image carries one extra long-lived S6 service (`open-url-api`) and one
+  new nginx location. The daemon blocks on a condition variable and wakes in
+  0.5 s slices to detect a disconnected client, so the idle cost is a
+  non-blocking select twice a second; an aborted long-poll releases its slot
+  and does not consume a queued link. Its queue is in-memory (8 items,
+  30 s TTL) and is lost on a daemon restart.
+- The link feature adds no runtime dependencies: the daemon, forwarder and
+  client use the Python standard library and plain browser JavaScript.
+- The forwarder runs on every `xdg-open` call. Non-URL arguments and daemon
+  failures fall back to the real binary, so local attachments and the
+  previous behavior are unchanged.
+- A single `obsidian://` argument is routed to the app launcher instead of
+  the real `xdg-open`; the URI is passed as one argument through `execv`,
+  never through a shell. If the launcher cannot be executed, the forwarder
+  falls back to the real `xdg-open`, which may show the previous blank
+  in-container page.
+- The image carries a second PATH overlay (`xdg-email`) and a mode switch
+  in the forwarder. A `mailto:` is queued only while the daemon is up; if
+  the launcher cannot reach it, the real `xdg-email` receives the link, and
+  the image has no mail client to open it.
+- The client allows exactly `http`, `https`, `mailto`, `tel` and `sms`.
+  `mailto`, `tel` and `sms` are toast-first (one user click) instead of
+  optimistic, because external-protocol launches require a user gesture.
+  Other schemes still fall back to the real `xdg-open` in the container,
+  where a missing handler may leave a blank page.
+- Encoded CR/LF/NUL are rejected for the mail and phone schemes; the queue
+  and the client never accept an arbitrary scheme.
+- `HARDEN_DESKTOP=true` makes the base image `chmod 0000` the resolved
+  `xdg-open`, which disables the feature by design.
+- The feature depends on the Selkies nginx template and the dashboard
+  `</head>` anchor; the Dockerfile's grep guards fail the build if a
+  base-image bump moves them.
+- A queued link is delivered to the first live waiting client; the external
+  `GET /api/open-url` surface is read-only and behind Home Assistant
+  authentication under ingress.

@@ -1,0 +1,5 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+# Runs the external-link daemon as the abc account; it only queues URLs and
+# has no filesystem access.
+exec s6-setuidgid abc python3 /opt/ha-open-url/open_url_server.py
