@@ -198,6 +198,59 @@ def test_obsidian_diagnostics_do_not_include_the_full_uri(monkeypatch, capsys) -
     assert "private" not in stderr
 
 
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["https://example.com/a"], "forward"),
+        (["http://example.com"], "forward"),
+        (["HTTPS://EXAMPLE.COM"], "forward"),
+        (["obsidian://show-plugin?id=obsidian-importer"], "app"),
+        (["file:///config/note.pdf"], "fallback"),
+        (["/config/note.pdf"], "fallback"),
+        (["mailto:user@example.com?subject=Hi"], "fallback"),
+        (["tel:+15551234567"], "fallback"),
+        (["sms:+15551234567"], "fallback"),
+        (["ftp://example.com/file"], "fallback"),
+        (["zotero://select/library/items/ABCD"], "fallback"),
+        (["javascript:alert(1)"], "fallback"),
+        (["data:text/html,<h1>x</h1>"], "fallback"),
+        (["about:blank"], "fallback"),
+        (["app://obsidian.md/index.html"], "fallback"),
+        (["obsidian://"], "fallback"),
+        (["OBSIDIAN://show-plugin?id=x"], "fallback"),
+        (["https://a", "https://b"], "fallback"),
+        ([], "fallback"),
+    ],
+)
+def test_main_routes_each_link_class(monkeypatch, argv, expected) -> None:
+    # Given one link class and stubs for every destination
+    routes: list[tuple[str, list[str]]] = []
+
+    def fake_send(
+        url: str, endpoint: str | None = None, timeout: float | None = None
+    ) -> None:
+        routes.append(("forward", [url]))
+
+    def fake_app(args: list[str], launcher: str) -> None:
+        routes.append(("app", list(args)))
+        raise SystemExit(0)
+
+    def fake_real(args: list[str], real: str) -> None:
+        routes.append(("fallback", list(args)))
+        raise SystemExit(0)
+
+    monkeypatch.setattr(forwarder, "send", fake_send)
+    monkeypatch.setattr(forwarder, "exec_app", fake_app)
+    monkeypatch.setattr(forwarder, "exec_real", fake_real)
+    # When the forwarder runs
+    try:
+        forwarder.main(list(argv))
+    except SystemExit:
+        pass
+    # Then exactly the documented destination receives the original argument
+    assert routes == [(expected, list(argv))]
+
+
 def test_send_posts_json() -> None:
     # Given a running daemon stub
     stub = StubServer()

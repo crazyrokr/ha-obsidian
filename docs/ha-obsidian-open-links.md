@@ -20,6 +20,28 @@ add-on, instead of opening them inside the container's desktop.
   follows the active Home Assistant theme, and offers **Open**, **Copy** and
   **Dismiss**.
 
+### Link types
+
+| Link in Obsidian | Leaves the app as | Lands in |
+|---|---|---|
+| `http://`, `https://` | `shell.openExternal` → `xdg-open` → forwarder | the viewing browser, unless the Web viewer intercepts |
+| `obsidian://…` | `xdg-open` → forwarder → `/usr/bin/obsidian` | the streamed Obsidian app |
+| `file://…`, plain local paths | `xdg-open` → real binary | the in-container desktop |
+| `mailto:…` | Electron `xdg-email` (not `xdg-open`) | the container's mail handler; none is installed, so normally nothing |
+| `tel:`, `sms:`, `ftp:`, `zotero:` and other schemes | `shell.openExternal` → `xdg-open` → real binary | an in-container handler if one exists; otherwise the browser fallback may show a blank page |
+| `javascript:`, `data:`, malformed or over-long values | `xdg-open` | rejected by the forwarder; never queued for the viewing browser |
+| internal links, `[[wikilinks]]`, anchors, `app://` | Obsidian internal | never reach the OS |
+
+Obsidian itself asks for confirmation before handing any scheme other than
+`http(s)`, `obsidian` and existing local files to the OS, with an "always
+open" checkbox; the add-on does not override that step.
+
+The rule is narrow by design: only `http(s)` is queued for the viewing
+browser, only `obsidian://` is routed to the app, and every other argument
+keeps the in-container behavior. `mailto:` is not forwarded — forwarding it
+would need an `xdg-email` overlay plus a daemon/client scheme allowlist (a
+separate follow-up), and the image installs no mail client anyway.
+
 ## 2. Architecture
 
 ```text
@@ -166,8 +188,13 @@ viewed from any device.
   `xdg-open`, which may show a blank in-container page; the log shows
   `scheme=obsidian outcome=app` on the working path and `outcome=fallback`
   otherwise.
-- **`mailto:` and other schemes.** Electron uses `xdg-email` for `mailto:`
-  and other schemes are not forwarded; this is out of scope.
+- **`mailto:` and other schemes.** They are intentionally not forwarded.
+  Electron hands `mailto:` to `xdg-email`; the image installs no mail
+  client, so normally nothing opens in the viewing browser. Other schemes
+  (`tel:`, `zotero:`, …) fall back to the in-container `xdg-open`; without
+  a handler, Chromium's fallback may show a blank in-container page. If the
+  session's `xdg-email` delegates to `xdg-open`, the add-on log shows
+  `scheme=mailto outcome=fallback`.
 - **`HARDEN_DESKTOP=true`.** The base image makes `xdg-open` non-executable,
   so the feature is off by design.
 - **Multiple viewers.** A queued link is consumed by the first waiting
@@ -195,7 +222,12 @@ viewed from any device.
    in streamed Obsidian, and the log shows `scheme=obsidian outcome=app`.
 8. Enable the Web viewer core plugin and click a link — it opens in the
    in-app viewer; disabling the plugin restores forwarding.
-9. Repeat 2–3 in Chrome and Firefox (and one mobile client if available).
+9. Click a `mailto:` link — Obsidian's scheme warning appears (once);
+   after allowing, no tab opens in the viewing browser and the link does
+   not reach the toast.
+10. Click a `tel:` or `zotero://` link — the same warning; the link stays in
+    the container, where a blank page is expected when no handler exists.
+11. Repeat 2–3 in Chrome and Firefox (and one mobile client if available).
 
 ## 8. Files
 

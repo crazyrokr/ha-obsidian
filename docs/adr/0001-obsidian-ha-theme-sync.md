@@ -289,6 +289,13 @@ detects the HA theme and posts it to the daemon through nginx.
   never through a shell. If the launcher cannot be executed, the forwarder
   falls back to the real `xdg-open`, which may show the previous blank
   in-container page.
+- Non-web schemes are unchanged by design: Electron hands `mailto:` to
+  `xdg-email` (the image installs no mail client, so it normally does
+  nothing), and other schemes fall back to the real `xdg-open`, which may
+  hit Chromium's browser fallback for an unregistered scheme. Only
+  `http(s)` is forwarded to the viewing browser and only `obsidian://` is
+  routed to the app; widening that is a policy decision (an `xdg-email`
+  overlay plus a scheme allowlist), not an oversight.
 - `HARDEN_DESKTOP=true` makes the base image `chmod 0000` the resolved
   `xdg-open`, which disables the feature by design.
 - The feature depends on the Selkies nginx template and the dashboard
