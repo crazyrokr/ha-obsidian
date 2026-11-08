@@ -1,5 +1,6 @@
 {
   "lscr.io/linuxserver/obsidian:v1.14.4-ls149": "sha256:ca9c7878429b70d61129a614e95418fd930d5dcb5dc1c1f6ec2c132f0e6122a2",
   "lscr.io/linuxserver/obsidian:v1.14.5-ls150": "sha256:da0e7e082b5922fe9f9065254e38e7b9875211f85089834f5e822f7037dbfabb",
-  "lscr.io/linuxserver/obsidian:v1.14.5-ls151": "sha256:37716e2370ec8e3c6d0aa30f758bd0646916c64cd07d157c15ed8db856398eb1"
+  "lscr.io/linuxserver/obsidian:v1.14.5-ls151": "sha256:37716e2370ec8e3c6d0aa30f758bd0646916c64cd07d157c15ed8db856398eb1",
+  "lscr.io/linuxserver/obsidian:v1.15.0-ls152": "sha256:c0e24740ba1518380f824e6e70f85655fd00e7ba3946866eab8f6bf5a3208af1"
 }
